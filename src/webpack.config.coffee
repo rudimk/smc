@@ -31,7 +31,7 @@ Resources for learning webpack:
 This webpack config file might look scary, but it only consists of a few moving parts.
 
 1. There is the "main" SMC application, which is split into "css", "lib" and "smc":
-   1. css: a collection of all static styles from various locations. it might be possible
+   1. css: a collection of all static styles from various locations. It might be possible
       to use the text extraction plugin to make this a .css file, but that didn't work out.
       Some css is inserted, but it doesn't work and no styles are applied. In the end,
       it doesn't matter to load it one way or the other. Furthermore, as .js is even better,
@@ -90,6 +90,7 @@ glob          = require('glob')
 child_process = require('child_process')
 misc_node     = require('smc-util-node/misc_node')
 async         = require('async')
+program       = require('commander')
 
 SMC_VERSION   = require('smc-util/smc-version').version
 
@@ -105,28 +106,38 @@ DEVEL         = "development"
 NODE_ENV      = process.env.NODE_ENV || DEVEL
 PRODMODE      = NODE_ENV != DEVEL
 DEVMODE       = not PRODMODE
+MINIFY        = !! process.env.WP_MINIFY
+DEBUG         = '--debug' in process.argv
 SOURCE_MAP    = !! process.env.SOURCE_MAP
+QUICK_BUILD   = !! process.env.SMC_WEBPACK_QUICK
 date          = new Date()
 BUILD_DATE    = date.toISOString()
 BUILD_TS      = date.getTime()
+GOOGLE_ANALYTICS = misc_node.GOOGLE_ANALYTICS
 
 # create a file base_url to set a base url
 BASE_URL      = misc_node.BASE_URL
-console.log "SMC_VERSION  = #{SMC_VERSION}"
-console.log "SMC_GIT_REV  = #{GIT_REV}"
-console.log "NODE_ENV     = #{NODE_ENV}"
-console.log "BASE_URL     = #{BASE_URL}"
-console.log "INPUT        = #{INPUT}"
-console.log "OUTPUT       = #{OUTPUT}"
+
+# output build environment variables of webpack
+console.log "SMC_VERSION      = #{SMC_VERSION}"
+console.log "SMC_GIT_REV      = #{GIT_REV}"
+console.log "NODE_ENV         = #{NODE_ENV}"
+console.log "BASE_URL         = #{BASE_URL}"
+console.log "DEBUG            = #{DEBUG}"
+console.log "MINIFY           = #{MINIFY}"
+console.log "INPUT            = #{INPUT}"
+console.log "OUTPUT           = #{OUTPUT}"
+console.log "GOOGLE_ANALYTICS = #{GOOGLE_ANALYTICS}"
 
 # mathjax version → symlink with version info from package.json/version
 MATHJAX_URL    = misc_node.MATHJAX_URL  # from where the files are served
 MATHJAX_ROOT   = misc_node.MATHJAX_ROOT # where the symlink originates
 MATHJAX_LIB    = misc_node.MATHJAX_LIB  # where the symlink points to
-console.log "MATHJAX_URL  = #{MATHJAX_URL}"
-console.log "MATHJAX_ROOT = #{MATHJAX_ROOT}"
-console.log "MATHJAX_LIB  = #{MATHJAX_LIB}"
+console.log "MATHJAX_URL      = #{MATHJAX_URL}"
+console.log "MATHJAX_ROOT     = #{MATHJAX_ROOT}"
+console.log "MATHJAX_LIB      = #{MATHJAX_LIB}"
 
+# adds a banner to each compiled and minified source .js file
 banner = new webpack.BannerPlugin(
                         """\
                         This file is part of #{TITLE}.
@@ -150,8 +161,9 @@ class MathjaxVersionedSymlink
 mathjaxVersionedSymlink = new MathjaxVersionedSymlink()
 
 # deterministic hashing for assets
-WebpackSHAHash = require('webpack-sha-hash')
-webpackSHAHash = new WebpackSHAHash()
+# TODO this sha-hash lib sometimes crashes. switch to https://github.com/erm0l0v/webpack-md5-hash and try if that works!
+#WebpackSHAHash = require('webpack-sha-hash')
+#webpackSHAHash = new WebpackSHAHash()
 
 # cleanup like "make distclean"
 # otherwise, compiles create an evergrowing pile of files
@@ -199,18 +211,19 @@ base_url_html = BASE_URL # do *not* modify BASE_URL, it's needed with a '/' down
 while base_url_html and base_url_html[base_url_html.length-1] == '/'
     base_url_html = base_url_html.slice(0, base_url_html.length-1)
 
-# this is the main indes.html file, which should be served without any caching
-jade2html = new HtmlWebpackPlugin
-                        date     : BUILD_DATE
-                        title    : TITLE
-                        BASE_URL : base_url_html
-                        git_rev  : GIT_REV
-                        mathjax  : MATHJAX_URL
-                        filename : 'index.html'
-                        chunksSortMode: smcChunkSorter
-                        hash     : PRODMODE
-                        template : path.join(INPUT, 'index.jade')
-                        minify   : htmlMinifyOpts
+# this is the main index.html file, which should be served without any caching
+pug2html = new HtmlWebpackPlugin
+                        date             : BUILD_DATE
+                        title            : TITLE
+                        BASE_URL         : base_url_html
+                        git_rev          : GIT_REV
+                        mathjax          : MATHJAX_URL
+                        filename         : 'index.html'
+                        chunksSortMode   : smcChunkSorter
+                        hash             : PRODMODE
+                        template         : path.join(INPUT, 'index.pug')
+                        minify           : htmlMinifyOpts
+                        GOOGLE_ANALYTICS : GOOGLE_ANALYTICS
 
 # the following set of plugins renders the policy pages
 # they do *not* depend on any of the chunks, but rather specify css and favicon dependencies
@@ -231,13 +244,13 @@ videoChatSide = new HtmlWebpackPlugin
                         filename : "webrtc/group_chat_side.html"
                         inject   : 'head'
                         template : 'webapp-lib/webrtc/group_chat_side.html'
-                        chunks   : []
+                        chunks   : ['css']
                         minify   : htmlMinifyOpts
 videoChatCell = new HtmlWebpackPlugin
                         filename : "webrtc/group_chat_cell.html"
                         inject   : 'head'
                         template : 'webapp-lib/webrtc/group_chat_cell.html'
-                        chunks   : []
+                        chunks   : ['css']
                         minify   : htmlMinifyOpts
 
 # global css loader configuration
@@ -302,11 +315,22 @@ setNODE_ENV         = new webpack.DefinePlugin
                                 'SMC_GIT_REV' : JSON.stringify(GIT_REV)
                                 'BUILD_DATE'  : JSON.stringify(BUILD_DATE)
                                 'BUILD_TS'    : JSON.stringify(BUILD_TS)
+                                'DEBUG'       : JSON.stringify(DEBUG)
 
 # This is not used, but maybe in the future.
 # Writes a JSON file containing the main webpack-assets and their filenames.
 {StatsWriterPlugin} = require("webpack-stats-plugin")
 statsWriterPlugin   = new StatsWriterPlugin(filename: "webpack-stats.json")
+
+# https://webpack.github.io/docs/shimming-modules.html
+# do *not* require('jquery') but $ = window.$
+# this here doesn't work, b/c some modifications/plugins simply do not work when this is set
+# rather, webapp-lib.coffee defines the one and only global jquery instance!
+#provideGlobals      = new webpack.ProvidePlugin
+#                                        '$'             : 'jquery'
+#                                        'jQuery'        : 'jquery'
+#                                        "window.jQuery" : "jquery"
+#                                        "window.$"      : "jquery"
 
 # this is for debugging: adding it prints out a long long json of everything
 # that ends up inside the chunks. that way, one knows exactly where which part did end up.
@@ -327,21 +351,19 @@ plugins = [
     #provideGlobals,
     setNODE_ENV,
     banner,
-    jade2html,
-    videoChatSide,
-    videoChatCell,
+    pug2html,
     #commonsChunkPlugin,
-    assetsPlugin,
     #extractCSS,
     #copyWebpackPlugin
-    webpackSHAHash,
-    statsWriterPlugin,
+    #webpackSHAHash,
     #new PrintChunksPlugin(),
     mathjaxVersionedSymlink,
     #linkFilesIntoTargetPlugin,
 ]
 
-plugins = plugins.concat(policyPages)
+if not QUICK_BUILD or PRODMODE
+    plugins = plugins.concat(policyPages)
+    plugins = plugins.concat([videoChatSide, videoChatCell, assetsPlugin, statsWriterPlugin])
 
 if PRODMODE
     console.log "production mode: enabling compression"
@@ -349,8 +371,11 @@ if PRODMODE
     # plugins.push new webpack.optimize.CommonsChunkPlugin(name: "lib")
     plugins.push new webpack.optimize.DedupePlugin()
     plugins.push new webpack.optimize.OccurenceOrderPlugin()
-    plugins.push new webpack.optimize.LimitChunkCountPlugin(maxChunks: 10)
+    # TODO change this back to a number at about 10, once we know how to keep old chunks around
+    plugins.push new webpack.optimize.LimitChunkCountPlugin(maxChunks: 1)
     plugins.push new webpack.optimize.MinChunkSizePlugin(minChunkSize: 32768)
+
+if PRODMODE or MINIFY
     # to get source maps working in production mode, one has to figure out how
     # to get inSourceMap/outSourceMap working here.
     plugins.push new webpack.optimize.UglifyJsPlugin
@@ -397,8 +422,9 @@ module.exports =
     cache: true
 
     # https://webpack.github.io/docs/configuration.html#devtool
-    # don't use cheap-module-eval-source-map produces too large files
-    devtool: if SOURCE_MAP then 'source-map' else false
+    # **do** use cheap-module-eval-source-map; it produces too large files, but who cares since we are not
+    # using this in production.  DO NOT use 'source-map', which is VERY slow.
+    devtool: if SOURCE_MAP then '#cheap-module-eval-source-map'
 
     entry: # ATTN don't alter or add names here, without changing the sorting function above!
         css  : 'webapp-css.coffee'
@@ -414,6 +440,7 @@ module.exports =
 
     module:
         loaders: [
+            { test: /pnotify.*\.js$/, loader: "imports?define=>false,global=>window" },
             { test: /\.cjsx$/,   loaders: ['coffee-loader', 'cjsx-loader'] },
             { test: /\.coffee$/, loader: 'coffee-loader' },
             { test: /\.less$/,   loaders: ["style-loader", "css-loader", "less?#{cssConfig}"]}, #loader : extractTextLess }, #
@@ -432,7 +459,7 @@ module.exports =
             { test: /\.(ttf|eot)(\?v=[0-9].[0-9].[0-9])?$/, loader: "file-loader?name=#{hashname}" },
             # { test: /\.css$/,    loader: 'style!css' },
             { test: /\.css$/, loaders: ["style-loader", "css-loader?#{cssConfig}"]}, # loader: extractTextCss }, #
-            { test: /\.jade$/, loader: 'jade' },
+            { test: /\.pug$/, loader: 'pug-loader' },
         ]
 
     resolve:
@@ -444,6 +471,9 @@ module.exports =
                       path.resolve(__dirname, 'smc-util/node_modules'),
                       path.resolve(__dirname, 'smc-webapp'),
                       path.resolve(__dirname, 'smc-webapp/node_modules')]
+        #alias:
+        #    "jquery-ui": "jquery-ui/jquery-ui.js", # bind version of jquery-ui
+        #    modules: path.join(__dirname, "node_modules") # bind to modules;
 
     plugins: plugins
 
@@ -456,3 +486,4 @@ module.exports =
         minifyCSS            : true
         collapseWhitespace   : true
         conservativeCollapse : true   # absolutely necessary, also see above in module.loaders/.html
+

@@ -2,7 +2,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2015, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -19,11 +19,23 @@
 #
 ###############################################################################
 
+# The following limit massively reduces the chances of a feedback-loop/race
+# condition bug causing the servers to get killed.   Clients may currently
+# just silently not open new docs if they hit the limit, which is bad.  However,
+# it's very unlikely somebody has 100 files open at once on purpose -- the browser
+# would likely die.  This is meant to prevent situations where a *bug* causes
+# thousands of changefeeds to get opened in a second.
+# If there were a better error, this could be a parameter that depends on
+# whether the user (or project) is paying or not.
+MAX_CHANGEFEEDS_PER_CLIENT = 4*100 # about 3-5 feeds per file right now
+
 fs         = require('fs')
 async      = require('async')
 underscore = require('underscore')
 moment     = require('moment')
 uuid       = require('node-uuid')
+zlib       = require('zlib')
+snappy     = require('snappy')
 
 json_stable_stringify = require('json-stable-stringify')
 
@@ -188,6 +200,8 @@ class RethinkDB
             opts.cb?(err, @)
         )
 
+    engine: -> 'rethink'
+
     concurrent: () =>
         return @_concurrent_queries
 
@@ -339,6 +353,12 @@ class RethinkDB
                     else
                         run_cbs[full_query_string] = [cb]
 
+                if opts.leave_cursor
+                    delete opts.leave_cursor
+                    leave_cursor = true
+                else
+                    leave_cursor = false
+
                 error = result = undefined
                 f = (cb) ->
                     start = new Date()
@@ -416,7 +436,7 @@ class RethinkDB
                                 error = err
                                 cb()  # done -- will report error back to original query
                             else
-                                if "#{x}" == "[object Cursor]"
+                                if "#{x}" == "[object Cursor]" and not leave_cursor
                                     # It's a cursor, so we convert it to an array, which is more convenient to work with, and is OK
                                     # by default, given the size of our data (typically very small -- all one pickle to client usually).
                                     x.toArray (err, x) ->   # converting to an array gets result as callback
@@ -749,7 +769,7 @@ class RethinkDB
                 @r.dbDrop(@_database).run(opts.cb)
 
     # Deletes all the contents of the tables in the database.  It doesn't
-    # delete indexes or or tables.
+    # delete anything about the schema itself: indexes or tables.
     delete_all: (opts) =>
         if not @_confirm_delete(opts)
             return
@@ -814,7 +834,7 @@ class RethinkDB
     log: (opts) =>
         opts = defaults opts,
             event : required    # string
-            value : required
+            value : required    # object
             cb    : undefined
         value = if typeof(opts.value) == 'object' then misc.map_without_undefined(opts.value) else opts.value
         @table('central_log').insert({event:opts.event, value:value, time:new Date()}).run((err)=>opts.cb?(err))
@@ -1108,7 +1128,7 @@ class RethinkDB
                     email_address = x?.email_address
                     cb(err)
             (cb) =>
-                query.update({first_name: 'Deleted', last_name:'User', email_address_before_delete:email_address}).run(cb)
+                query.update({email_address_before_delete:email_address}).run(cb)
             (cb) =>
                 query.replace(@r.row.without('email_address')).run(cb)
             (cb) =>
@@ -1838,14 +1858,6 @@ class RethinkDB
         if not @_validate_opts(opts) then return
         @table('projects').get(opts.project_id).update(opts.data).run(opts.cb)
 
-    get_project_data: (opts) =>
-        opts = defaults opts,
-            project_id  : required
-            columns     : PROJECT_COLUMNS
-            cb          : required
-        if not @_validate_opts(opts) then return
-        @table('projects').get(opts.project_id).pluck(opts.columns...).run(opts.cb)
-
     _validate_opts: (opts) =>
         for k, v of opts
             if k.slice(k.length-2) == 'id'
@@ -1874,6 +1886,20 @@ class RethinkDB
             cb         : required  # cb(err)
         if not @_validate_opts(opts) then return
         @table('projects').get(opts.project_id).update(users:{"#{opts.account_id}":{group:opts.group}}).run(opts.cb)
+
+    set_project_status: (opts) =>
+        opts = defaults opts,
+            project_id : required
+            status     : required
+            cb         : undefined
+        @table('projects').get(opts.project_id).update(status: opts.status).run(opts.cb)
+
+    set_compute_server_status: (opts) =>
+        opts = defaults opts,
+            host   : required
+            status : required
+            cb     : undefined
+        @table('compute_servers').get(opts.host).update(status:@r.literal(opts.status)).run(opts.cb)
 
     remove_collaborator_from_project: (opts) =>
         opts = defaults opts,
@@ -2079,8 +2105,7 @@ class RethinkDB
             else
                 opts.cb(undefined, group in opts.groups)
 
-    # all id's of projects having anything to do with the given account (ignores
-    # hidden projects unless opts.hidden is true).
+    # all id's of projects having anything to do with the given account
     get_project_ids_with_user: (opts) =>
         opts = defaults opts,
             account_id : required
@@ -2668,6 +2693,8 @@ class RethinkDB
                                    # infinite ttl = 0 or undefined.
             project_id : required  # the id of the project that is saving the blob
             check      : false     # if true, will give error if misc_node.uuidsha1(opts.blob) != opts.uuid
+            compress   : undefined # optional compression to use: 'gzip', 'zlib', 'snappy'; only used if blob not already in db.
+            level      : -1        # compression level (if compressed) -- see https://github.com/expressjs/compression#level
             cb         : required  # cb(err, ttl actually used in seconds); ttl=0 for infinite ttl
         if opts.check
             uuid = misc_node.uuidsha1(opts.blob)
@@ -2684,12 +2711,32 @@ class RethinkDB
                         blob       : opts.blob
                         project_id : opts.project_id
                         count      : 0
-                        size       : opts.blob.length
                         created    : new Date()
                     if opts.ttl
                         x.expire = expire_time(opts.ttl)
-                    @table('blobs').insert(x).run (err) =>
+                    async.series([
+                        (cb) =>
+                            if not opts.compress?
+                                cb(); return
+                            x.compress = opts.compress
+                            switch opts.compress
+                                when 'gzip'
+                                    zlib.gzip x.blob, {level:opts.level}, (err, blob) =>
+                                        x.blob = blob; cb(err)
+                                when 'zlib'
+                                    zlib.deflate x.blob, {level:opts.level}, (err, blob) =>
+                                        x.blob = blob; cb(err)
+                                when 'snappy'
+                                    snappy.compress x.blob, (err, blob) =>
+                                        x.blob = blob; cb(err)
+                                else
+                                    cb("compression format '#{opts.compress}' not implemented")
+                        (cb) =>
+                            x.size = x.blob.length  # set here, since may change on compression above.
+                            @table('blobs').insert(x).run(cb)
+                    ], (err) =>
                         opts.cb(err, opts.ttl)
+                    )
                 else
                     # some other error
                     opts.cb(err)
@@ -2762,6 +2809,21 @@ class RethinkDB
                 else
                     # blob not local and not in gcloud -- this shouldn't happen (just view this as "expired" by not setting blob)
                     cb()
+            (cb) =>
+                if not blob? or not x?.compress
+                    cb(); return
+                switch x.compress
+                    when 'gzip'
+                        zlib.gunzip blob, (err, _blob) =>
+                            blob = _blob; cb(err)
+                    when 'zlib'
+                        zlib.inflate blob, (err, _blob) =>
+                            blob = _blob; cb(err)
+                    when 'snappy'
+                        snappy.uncompress blob, (err, _blob) =>
+                            blob = _blob; cb(err)
+                    else
+                        cb("compression format '#{x.compress}' not implemented")
         ], (err) =>
             opts.cb(err, blob)
             if blob? and opts.touch
@@ -2793,7 +2855,7 @@ class RethinkDB
                         cb('no such blob')
                     else if not x.blob and not x.gcloud
                         cb('blob not available -- this should not be possible')
-                    else if not x.blob and x.force
+                    else if not x.blob and opts.force
                         cb("blob can't be reploaded since it was already deleted")
                     else
                         cb()
@@ -2971,13 +3033,23 @@ class RethinkDB
     blob_maintenance: (opts) =>
         opts = defaults opts,
             path              : '/backup/blobs'
-            map_limit         : 2
+            map_limit         : 5
             blobs_per_tarball : 10000
             throttle          : 0
             cb                : undefined
         dbg = @dbg("blob_maintenance()")
         dbg()
         async.series([
+            (cb) =>
+                # SKIP
+                cb(); return
+                dbg("maintain the patches and syncstrings")
+                @syncstring_maintenance
+                    repeat_until_done : true
+                    limit             : 500
+                    map_limit         : opts.map_limit
+                    delay             : 1000    # 1s, since syncstring_maintence heavily loads db
+                    cb                : cb
             (cb) =>
                 dbg("backup_blobs_to_tarball")
                 @backup_blobs_to_tarball
@@ -2991,8 +3063,8 @@ class RethinkDB
                 dbg("copy_all_blobs_to_gcloud")
                 errors = {}
                 @copy_all_blobs_to_gcloud
-                    limit               : 1000
-                    repeat_until_done_s : 5
+                    limit               : 2000
+                    repeat_until_done_s : 1
                     errors              : errors
                     remove              : true
                     map_limit           : opts.map_limit
@@ -3085,6 +3157,183 @@ class RethinkDB
 
         )
 
+
+    ###
+    # Syncstring maintainence
+    ###
+    syncstring_maintenance: (opts) =>
+        opts = defaults opts,
+            age_days          : 60    # archive patches of syncstrings that are inactive for at least this long
+            map_limit         : 1     # how much parallelism to use
+            limit             : 1000 # do only this many per get query loop
+            repeat_until_done : true
+            delay             : 0    # artifical delay in ms between archiving.
+            total_limit       : 0    # only do this many **total**
+            count             : 0    # used internally for logging
+            start_time        : new Date()   # used internally for loggin
+            cb                : undefined
+        dbg = @dbg("syncstring_maintenance")
+        dbg(opts)
+        if opts.total_limit and opts.total_limit <= opts.count
+            opts.cb?()
+            return
+        syncstrings = undefined
+        async.series([
+            (cb) =>
+                dbg("determine inactive syncstring ids")
+                cutoff = misc.days_ago(opts.age_days)
+                filter = (@r.row('last_active').le(cutoff)).and(@r.row.hasFields('archived').not())
+                @table('syncstrings').filter(filter).limit(opts.limit).run (err, v) =>
+                    if v?
+                        syncstrings = (x.string_id for x in v)
+                    cb(err)
+            (cb) =>
+                dbg("archive patches for inactive syncstrings")
+                i = 0
+                f = (string_id, cb) =>
+                    i += 1
+                    opts.count += 1
+                    console.log("\n***** #{opts.count} (#{(new Date() - opts.start_time)/1000} seconds) -- #{i}/#{syncstrings.length}: archiving string #{string_id} ***** \n")
+                    @archive_patches
+                        string_id : string_id
+                        cb        : (err) ->
+                           if err or not opts.delay
+                               cb(err)
+                           else
+                               setTimeout(cb, opts.delay)
+                async.mapLimit(syncstrings, opts.map_limit, f, cb)
+        ], (err) =>
+            if err
+                opts.cb?(err)
+            else if opts.repeat_until_done and syncstrings.length == opts.limit
+                dbg("doing it again")
+                @syncstring_maintenance(opts)
+            else
+                opts.cb?()
+        )
+
+
+    archive_patches: (opts) =>
+        opts = defaults opts,
+            string_id : required
+            compress  : 'zlib'
+            level     : -1   # the default
+            cb        : undefined
+        dbg = @dbg("archive_patches(string_id='#{opts.string_id}')")
+        syncstring = patches = blob_uuid = project_id = undefined
+        patches_query = @table('patches').between([opts.string_id, @r.minval], [opts.string_id, @r.maxval])
+        async.series([
+            (cb) =>
+                dbg("get project_id")
+                @table('syncstrings').get(opts.string_id).pluck('project_id', 'archived').run (err, x) =>
+                    if err
+                        cb(err)
+                    else if not x?
+                        cb("no such syncstring with id '#{opts.string_id}'")
+                    else if x.archived
+                        cb("already archived")
+                    else
+                        project_id = x.project_id
+                        cb()
+            (cb) =>
+                dbg("get patches")
+                patches_query.run (err, x) =>
+                    patches = x; cb(err)
+            (cb) =>
+                dbg("create blob from patches")
+                blob = JSON.stringify(patches)
+                dbg('save blob')
+                blob_uuid = misc_node.uuidsha1(blob)
+                @save_blob
+                    uuid       : blob_uuid
+                    blob       : blob
+                    project_id : project_id
+                    compress   : opts.compress
+                    level      : opts.level
+                    cb         : cb
+            (cb) =>
+                dbg("update syncstring to indicate patches have been archived in a blob")
+                @table('syncstrings').get(opts.string_id).update(archived:blob_uuid).run(cb)
+            (cb) =>
+                dbg("actually delete patches")
+                patches_query.delete().run(cb)
+        ], (err) => opts.cb?(err))
+
+    unarchive_patches: (opts) =>
+        opts = defaults opts,
+            string_id : required
+            cb        : undefined
+        dbg = @dbg("unarchive_patches(string_id='#{opts.string_id}')")
+        syncstring_query = @table('syncstrings').get(opts.string_id)
+        syncstring_query.pluck('archived').run (err, x) =>
+            if err
+                opts.cb?(err)
+                return
+            blob_uuid = x.archived
+            if not blob_uuid
+                opts.cb()
+                return
+            blob = undefined
+            async.series([
+                (cb) =>
+                    dbg("download blob")
+                    @get_blob
+                        uuid : blob_uuid
+                        cb   : (err, x) =>
+                            if err
+                                cb(err)
+                            else if not x?
+                                cb("blob is gone")
+                            else
+                                blob = x
+                                cb(err)
+                (cb) =>
+                    dbg("extract blob")
+                    try
+                        patches = JSON.parse(blob)
+                    catch e
+                        cb("corrupt patches blob -- #{e}")
+                        return
+                    dbg("insert patches into patches table")
+                    @table('patches').insert(patches, conflict:'update').run(cb)
+                (cb) =>
+                    async.parallel([
+                        (cb) =>
+                            dbg("update syncstring to indicate that patches are now available")
+                            syncstring_query.replace(@r.row.without('archived')).run(cb)
+                        (cb) =>
+                            dbg('delete blob, which is no longer needed')
+                            @delete_blob
+                                uuid : blob_uuid
+                                cb   : cb
+                    ], cb)
+            ], (err) => opts.cb?(err))
+
+    delete_blob: (opts) =>
+        opts = defaults opts,
+            uuid : required
+            cb   : undefined
+        gcloud = undefined
+        dbg = @dbg("delete_blob(uuid='#{opts.uuid}')")
+        async.series([
+            (cb) =>
+                dbg("check if blob in gcloud")
+                @table('blobs').get(opts.uuid).pluck('gcloud').run (err, x) =>
+                    gcloud = x?.gcloud
+                    cb(err)
+            (cb) =>
+                if not gcloud
+                    cb()
+                    return
+                dbg("delete from gcloud")
+                @gcloud().bucket(name:gcloud).delete  #TODO -- needs test
+                    name : opts.uuid
+                    cb   : cb
+            (cb) =>
+                dbg("delete from local database")
+                @table('blobs').get(opts.uuid).delete().run(cb)
+        ], (err) => opts.cb?(err))
+
     ###
     # User queries
     ###
@@ -3098,19 +3347,38 @@ class RethinkDB
         if x?
             delete @_change_feeds[opts.id]
             @_user_query_stats.cancel_changefeed(changefeed_id: opts.id)
-            winston.debug("user_query_cancel_changefeed: #{opts.id} (num_feeds=#{misc.len(@_change_feeds)})")
             f = (y, cb) ->
                 y?.close(cb)
             async.map(x, f, ((err)->opts.cb?(err)))
         else
             opts.cb?()
+        winston.debug("user_query_cancel_changefeed: #{opts.id} (num_feeds=#{misc.len(@_change_feeds)})")
+
+        ## For serious low level debugging...
+        ##if @_change_feeds?
+        ##    winston.debug("current changefeed ids: #{misc.to_json(misc.keys(@_change_feeds))}")
+        ##    for id, v of @_change_feeds
+        ##        winston.debug("#{id}: #{misc.to_json(v[0]._smc_query)}")
+
+        # Also decrement count of changefeeds for given client
+        client_name = @_user_get_changefeed_id_to_user?[opts.id]
+        if client_name?
+            @_user_get_changefeed_counts[client_name] -= 1
+            delete @_user_get_changefeed_id_to_user[opts.id]
+            cnt = @_user_get_changefeed_counts
+            winston.debug("@_user_get_changefeed_counts={#{client_name}:#{cnt[client_name]} ...}")
+
 
     user_query: (opts) =>
         opts = defaults opts,
             account_id : undefined
             project_id : undefined
             query      : required
-            options    : []         # used for initial query; **IGNORED** by changefeed!; can use [{set:true}] or [{set:false}] to force get or set query
+            options    : []         # used for initial query; **IGNORED** by changefeed!;
+                                    #  - Use [{set:true}] or [{set:false}] to force get or set query
+                                    #  - For a set query, use {delete:true} to delete instead of set.  This is the only way
+                                    #    to deleete a record, and won't work unless delete:true is set in the schema
+                                    #    for the table to explicitly allow deleting.
             changes    : undefined  # id of change feed
             cb         : required   # cb(err, result)  # WARNING -- this *will* get called multiple times when changes is true!
         dbg = @dbg("user_query(...)")
@@ -3207,6 +3475,7 @@ class RethinkDB
                     project_id : opts.project_id
                     table      : table
                     query      : query
+                    options    : opts.options
                     cb         : (err, x) =>
                         if not err
                             on_success?()
@@ -3217,6 +3486,24 @@ class RethinkDB
                 if changes and not multi
                     opts.cb("changefeeds only implemented for multi-document queries")
                     return
+                if changes
+                    # Count the number of changefeeds by a given client so we can cap it.
+                    # This code is here rather than in @user_get_query (or elsewhere) to ensure
+                    # that the counter stays consistent.
+                    client_name = "#{opts.account_id}-#{opts.project_id}"
+                    cnt = @_user_get_changefeed_counts ?= {}
+                    ids = @_user_get_changefeed_id_to_user ?= {}
+                    if not cnt[client_name]?
+                        cnt[client_name] = 1
+                    else if cnt[client_name] >= MAX_CHANGEFEEDS_PER_CLIENT
+                        opts.cb("user may create at most #{MAX_CHANGEFEEDS_PER_CLIENT} changefeeds; please close files, refresh browser, restart project")
+                        return
+                    else
+                        # increment before successfully making it to prevent huge bursts causing trouble!
+                        cnt[client_name] += 1
+                    dbg("@_user_get_changefeed_counts={#{client_name}:#{cnt[client_name]} ...}")
+                    ids[changes.id] = client_name
+
                 @user_get_query
                     account_id : opts.account_id
                     project_id : opts.project_id
@@ -3225,7 +3512,10 @@ class RethinkDB
                     options    : options
                     multi      : multi
                     changes    : changes
-                    cb         : (err, x) => opts.cb(err, {"#{table}":x})
+                    cb         : (err, x) =>
+                        if err and changes
+                            cnt[client_name] -= 1  # didn't actually make the changefeed, so don't count it.
+                        opts.cb(err, {"#{table}":x})
         else
             opts.cb("invalid user_query of '#{table}' -- query must be an object")
 
@@ -3366,6 +3656,8 @@ class RethinkDB
                         x = parseInt(value)
                         if x > 0
                             heartbeat = x
+                    when 'delete'
+                        # ignore here - is parsed elsewhere
                     else
                         err:"unknown option '#{name}'"
         return {db_query:db_query, err:err, limit:limit, heartbeat:heartbeat}
@@ -3394,6 +3686,7 @@ class RethinkDB
             project_id : undefined
             table      : required
             query      : required
+            options    : undefined     # {delete:true} is the only supported option
             cb         : required   # cb(err)
         if opts.project_id?
             dbg = @dbg("user_set_query(project_id='#{opts.project_id}', table='#{opts.table}')")
@@ -3403,15 +3696,17 @@ class RethinkDB
             opts.cb("account_id or project_id must be specified")
             return
         dbg(to_json(opts.query))
+        if opts.options
+            dbg("options=#{misc.to_json(opts.options)}")
 
         @_user_query_stats.set_query
             account_id : opts.account_id
             project_id : opts.project_id
             table      : opts.table
 
-        query = misc.copy(opts.query)
-        table = opts.table
-        db_table = SCHEMA[opts.table].virtual ? table
+        query      = misc.copy(opts.query)
+        table      = opts.table
+        db_table   = SCHEMA[opts.table].virtual ? table
         account_id = opts.account_id
         project_id = opts.project_id
 
@@ -3528,6 +3823,25 @@ class RethinkDB
         old_val = undefined
         #dbg("on_change_hook=#{on_change_hook?}, #{to_json(misc.keys(client_query.set))}")
 
+        # set the query options -- order doesn't matter for set queries (unlike for get), so we
+        # just merge the options into a single dictionary.
+        # NOTE: As I write this, there is just one supported option: {delete:true}.
+        options = {}
+        if client_query.set.options?
+            for x in client_query.set.options
+                for y, z of x
+                    options[y] = z
+        if opts.options?
+            for x in opts.options
+                for y, z of x
+                    options[y] = z
+        dbg("options = #{misc.to_json(options)}")
+
+        if options.delete and not client_query.set.delete
+            # delete option is set, but deletes aren't explicitly allowed on this table.  ERROR.
+            opts.cb("delete from #{table} not allowed")
+            return
+
         async.series([
             (cb) =>
                 async.parallel([
@@ -3564,6 +3878,9 @@ class RethinkDB
                     cb()
             (cb) =>
                 if on_change_hook? or before_change_hook? or instead_of_change_hook?
+                    if not query[primary_key]?  # I noticed this in the log -- reql will flip on .get(undefined)
+                        cb("query must specify primary key '#{primary_key}'")
+                        return
                     # get the old value before changing it
                     @table(db_table).get(query[primary_key]).run (err, x) =>
                         old_val = x; cb(err)
@@ -3577,6 +3894,12 @@ class RethinkDB
             (cb) =>
                 if instead_of_change_hook?
                     instead_of_change_hook(@, old_val, query, account_id, cb)
+                else if options.delete
+                    if query[primary_key]
+                        dbg("delete based on primary key")
+                        @table(db_table).get(query[primary_key]).delete().run(cb)
+                    else
+                        cb("delete query must set primary key")
                 else
                     @table(db_table).insert(query, conflict:'update').run(cb)
             (cb) =>
@@ -3778,7 +4101,11 @@ class RethinkDB
             table      : required
             query      : required
             multi      : required
-            options    : required   # used for initial query; **IGNORED** by changefeed, except for {heartbeat:n}, which ensures that *something* is sent every n minutes, in case no changes are coming out of the changefeed. This is an additional measure in case the client somehow doesn't get a "this changefeed died" message.
+            options    : required   # used for initial query; **IGNORED** by changefeed, except for {heartbeat:n},
+                                    # which ensures that *something* is sent every n minutes, in case no
+                                    # changes are coming out of the changefeed. This is an additional
+                                    # measure in case the client somehow doesn't get a "this changefeed died" message.
+                                    # Use [{delete:true}] to instead delete the selected records (must have delete:true in schema).
             changes    : undefined  # {id:?, cb:?}
             cb         : required   # cb(err, result)
         ###
@@ -3858,16 +4185,28 @@ class RethinkDB
         # Apply default options to the get query (don't impact changefeed)
         # The user can overide these, e.g., if they were to want to explicitly increase a limit
         # to get more file use history.
+        delete_option = false  # will be true if an option is delete
+        user_options = {}
+        for x in opts.options
+            for y, z of x
+                if y == 'delete'
+                    delete_option = z
+                else
+                    user_options[y] = true
         if client_query.get.all?.options?
             # complicated since options is a list of {opt:val} !
-            user_options = {}
-            for x in opts.options
-                for y, z of x
-                    user_options[y] = true
             for x in client_query.get.all.options
                 for y, z of x
-                    if not user_options[y]
-                        opts.options.push(x)
+                    if y == 'delete'
+                        delete_option = z
+                    else
+                        if not user_options[y]
+                            opts.options.push(x)
+                            break
+
+        if opts.changes? and delete_option
+            opts.cb("user_get_query -- if opts.changes is specified, then delete option must not be specified")
+            return
 
         result = undefined
         table_name = SCHEMA[opts.table].virtual ? opts.table
@@ -3881,7 +4220,6 @@ class RethinkDB
         # efficient, and should only be used in situations where it will rarely happen.  E.g.,
         # the collaborators of a user don't change constantly.
         killfeed      = undefined
-        require_admin = false
         async.series([
             (cb) =>
                 if client_query.get.check_hook?
@@ -4093,13 +4431,14 @@ class RethinkDB
                 if filter?
                     db_query = db_query.filter(filter)
 
-                # Parse the pluck part of the query
-                pluck   = @_query_to_field_selector(query)
-                db_query = db_query.pluck(pluck)
+                if not delete_option
+                    # Parse the pluck part of the query
+                    pluck   = @_query_to_field_selector(query)
+                    db_query = db_query.pluck(pluck)
 
-                # If not multi, limit to one result
-                if not opts.multi
-                    db_query = db_query.limit(1)
+                    # If not multi, limit to one result
+                    if not opts.multi
+                        db_query = db_query.limit(1)
 
                 # Parse option part of the query
                 db_query_no_opts = db_query
@@ -4107,6 +4446,10 @@ class RethinkDB
                 dbg("heartbeat = #{heartbeat}")
                 if err
                     cb(err); return
+
+                if delete_option
+                    dbg("doing a delete query")
+                    db_query = db_query.delete()
 
                 dbg("run the query -- #{to_json(opts.query)}")
                 time_start = misc.walltime()
@@ -4168,6 +4511,7 @@ class RethinkDB
                         else
                             @_change_feeds ?= {}
                             @_change_feeds[changefeed_id] = [feed]
+                            feed._smc_query = {query:opts.query, account_id:opts.account_id, project_id:opts.project_id}  # for logging purposes only
                             @_user_query_stats.changefeed
                                 account_id    : opts.account_id
                                 project_id    : opts.project_id
@@ -4700,6 +5044,205 @@ class RethinkDB
                 dbg("total time=#{misc.walltime(t0)}; got #{result.projects.length} ")
                 opts.cb?(err, result.projects)
     ###
+
+    ###
+    One off database migration code.  Will get deleted.
+    ###
+    update_migrate: (opts) =>
+        opts = defaults opts,
+            hours  : 24
+            tables : ['central_log', 'client_error_log', 'file_access_log', 'project_log', 'blobs', 'syncstrings', 'patches']
+            #tables : ['project_log']
+            cb     : required
+        @_error_thresh = 1000000
+        f = (table, cb) =>
+            @["update_#{table}"](start:misc.hours_ago(opts.hours), cb:cb)
+        async.mapSeries(opts.tables, f, opts.cb)
+
+    update_client_error_log: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/client_error_log/smc/update-client_error_log.json'
+            cb    : required
+        @get_client_error_log
+            start : opts.start
+            end   : misc.minutes_ago(-60)
+            cb    : (err, log) =>
+                if err
+                    opts.cb(err)
+                else
+                    try
+                        fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                    catch
+                        # ignore
+                    for x in log
+                        x.time = json_time(x.time)
+                    s = '[\n' + (JSON.stringify(x) for x in log).join(',\n') + '\n]\n'
+                    fs.writeFile(opts.path, s, opts.cb)
+
+    update_central_log: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/central_log/smc/update-central_log.json'
+            cb    : required
+        @get_log
+            start : opts.start
+            end   : misc.minutes_ago(-60)
+            cb    : (err, log) =>
+                if err
+                    opts.cb(err)
+                else
+                    try
+                        fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                    catch
+                        # ignore
+                    for x in log
+                        x.time = json_time(x.time)
+                    s = '[\n' + (JSON.stringify(x) for x in log).join(',\n') + '\n]\n'
+                    fs.writeFile(opts.path, s, opts.cb)
+
+    update_project_log: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/project_log/smc/update-project_log.json'
+            cb    : required
+        @get_log
+            start : opts.start
+            log   : 'project_log'
+            end   : misc.minutes_ago(-60)
+            cb    : (err, log) =>
+                if err
+                    opts.cb(err)
+                else
+                    try
+                        fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                    catch
+                        # ignore
+                    for x in log
+                        x.time = json_time(x.time)
+                    s = '[\n' + (JSON.stringify(x) for x in log).join(',\n') + '\n]\n'
+                    fs.writeFile(opts.path, s, opts.cb)
+
+    update_file_access_log: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/file_access_log/smc/update-file_access_log.json'
+            cb    : required
+        @get_log
+            start : opts.start
+            end   : misc.minutes_ago(-60)
+            log   : 'file_access_log'
+            cb    : (err, log) =>
+                if err
+                    opts.cb(err)
+                else
+                    try
+                        fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                    catch
+                        # ignore
+                    for x in log
+                        x.time = json_time(x.time)
+                    s = '[\n' + (JSON.stringify(x) for x in log).join(',\n') + '\n]\n'
+                    fs.writeFile(opts.path, s, opts.cb)
+
+    update_patches: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/patches/smc/update-patches.json'
+            cb    : required
+        # needs index! -- db.table('patches').indexCreate('time',db.r.row('id')(1)).run(done())
+        query = @table('patches').between(opts.start, misc.minutes_ago(-60), index:'time')
+        # for dev:
+        #query = @table('patches').limit(1000)   # COMMENT this out and replace by above query to do it right... but needs index
+        query.run {leave_cursor:true}, (err, cursor) =>
+            if err
+                opts.cb(err)
+            else
+                try
+                    fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                catch
+                    # ignore
+
+                first = true
+                process = (err, x) =>
+                    if err
+                        throw Error(err)
+                    x.id[1] = json_time(x.id[1])
+                    if x.sent?
+                        x.sent = json_time(x.sent)
+                    if x.prev?
+                        x.prev = json_time(x.prev)
+                    if first
+                        s = '[\n'
+                        first = false
+                        flag = 'w'
+                    else
+                        s = ',\n'
+                        flag = 'a'
+                    s += JSON.stringify(x)
+                    fs.writeFileSync(opts.path, s, {flag:flag})
+                try
+                    cursor.each process, () =>
+                        fs.writeFileSync(opts.path, '\n]\n', {flag:'a'})
+                        opts.cb()
+                catch e
+                    opts.cb(e)
+
+    update_syncstrings: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/syncstrings/smc/update-syncstrings.json'
+            cb    : required
+        # needs index! -- db.table('syncstrings').indexCreate('last_active').run(done())
+        query = @table('syncstrings').between(opts.start, misc.minutes_ago(-60), index:'last_active')
+        query.run (err, syncstrings) =>
+            if err
+                opts.cb(err)
+            else
+                try
+                    fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                catch
+                    # ignore
+                for x in syncstrings
+                    for k in ['last_active', 'last_file_change', 'last_snapshot']
+                        if x[k]?
+                            x[k] = json_time(x[k])
+                    if x.init?.time?
+                        x.init.time = json_time(x.init.time)
+
+                s = '[\n' + (JSON.stringify(x) for x in syncstrings).join(',\n') + '\n]\n'
+                fs.writeFile(opts.path, s, opts.cb)
+
+    update_blobs: (opts) =>
+        opts = defaults opts,
+            start : required
+            path  : '/migrate/data/blobs/smc/update-blobs.json'
+            cb    : required
+        # needs index! -- db.table('blobs').indexCreate('created').run(done())
+        # we do NOT copy over the actual blobs -- they **have** to get uploaded to gcloud before we'll ever
+        # see them from postgresql, as we didn't implement the binary format.
+        query = @table('blobs').between(opts.start, misc.minutes_ago(-60), index:'created').pluck('id','expire','created','project_id','last_active','count','size','gcloud','backup','compress')
+        query.run (err, blobs) =>
+            if err
+                opts.cb(err)
+            else
+                try
+                    fs.unlinkSync(opts.path.slice(0, opts.path.length-4) + 'csv')
+                catch
+                    # ignore
+                for x in blobs
+                    for k in ['expire', 'created', 'last_active']
+                        if x[k]?
+                            x[k] = json_time(x[k])
+                s = '[\n' + (JSON.stringify(x) for x in blobs).join(',\n') + '\n]\n'
+                fs.writeFile(opts.path, s, opts.cb)
+
+json_time = (x) ->
+    if not x? or x == 0
+        return undefined
+    if typeof(x) == 'string'
+        x = new Date(x)
+    return {"$reql_type$": "TIME", "epoch_time":(x - 0)/1000}
 
 # modify obj in place substituting keys as given.
 obj_key_subs = (obj, subs) ->

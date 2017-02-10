@@ -3,7 +3,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2014, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -24,12 +24,20 @@
 
 """
 Administration and Launch control of salvus components
+
+Use it like so
+
+import admin; reload(admin); a = admin.Services('dev/smc/conf/cloud.sagemath.com')
+a.monitor.go(10,3)
+
 """
 
 ####################
 # Standard imports
 ####################
 import json, logging, os, shutil, signal, socket, stat, subprocess, sys, time, tempfile
+
+DISK_THRESHOLD = int(os.environ.get("SMC_DISK_THRESHOLD", '96'))
 
 from string import Template
 
@@ -1287,7 +1295,7 @@ class Monitor(object):
 
     def database(self):
         ans = []
-        c = 'pidof rethinkdb'
+        c = 'pidof postgres'
         for k, v in self._hosts('database', c, wait=True, parallel=True, timeout=120).iteritems():
             d = {'host':k[0], 'service':'database'}
             if v.get('exit_status',1) != 0 :
@@ -1378,7 +1386,7 @@ class Monitor(object):
         print s
         return json.loads(s)
 
-    def disk_usage(self, hosts='all', disk_threshold=96):
+    def disk_usage(self, hosts='all', disk_threshold=DISK_THRESHOLD):
         """
         Verify that no disk is more than disk_threshold (=disk_threshold%).
         """

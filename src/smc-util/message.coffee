@@ -2,7 +2,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2014, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -221,6 +221,18 @@ message
     event          : 'account_creation_failed'
     id             : undefined
     reason         : required
+
+# client --> hub
+message
+    event        : 'delete_account'
+    id           : undefined
+    account_id   : required
+
+# hub --> client
+message
+    event        : 'account_deleted'
+    id           : undefined
+    error        : undefined
 
 # client <--> hub
 message
@@ -623,14 +635,16 @@ message
     account_id : required
 
 message
-    event      : 'invite_noncloud_collaborators'
-    id         : undefined
-    project_id : required
-    to         : required
-    subject    : undefined
-    email      : required    # spam vector
-    title      : required
-    link2proj  : required
+    event         : 'invite_noncloud_collaborators'
+    id            : undefined
+    project_id    : required
+    replyto       : undefined
+    replyto_name  : undefined
+    to            : required
+    subject       : undefined
+    email         : required    # spam vector
+    title         : required
+    link2proj     : required
 
 message
     event      : 'invite_noncloud_collaborators_resp'
@@ -961,8 +975,9 @@ message
     id          : undefined
     email_address : undefined # one of email or account_id must be given.
     account_id  : undefined   # user who will be invoiced
-    amount      : required   # currently in US dollars
-    description : required
+    amount      : undefined   # currently in US dollars  (if amount or desc not given, then only creates customer, not invoice)
+    description : undefined
+
 
 #############
 # Support Tickets → right now going through Zendesk

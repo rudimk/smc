@@ -2,7 +2,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2015, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -20,14 +20,47 @@
 ###############################################################################
 
 ###
-Chat
+Chat message JSON format:
+
+sender_id : String which is the original message sender's account id
+event     : Can only be "chat" right now.
+date      : A date string
+history   : Array of "History" objects (described below)
+editing   : Object of <account id's> : <"FUTURE">
+
+"FUTURE" Will likely contain their last edit in the future
+
+ --- History object ---
+author_id : String which is this message version's author's account id
+content   : The raw display content of the message
+date      : The date this edit was sent
+
+Example object:
+{"sender_id":"07b12853-07e5-487f-906a-d7ae04536540",
+"event":"chat",
+"history":[
+        {"author_id":"07b12853-07e5-487f-906a-d7ae04536540","content":"First edited!","date":"2016-07-23T23:10:15.331Z"},
+        {"author_id":"07b12853-07e5-487f-906a-d7ae04536540","content":"Initial sent message!","date":"2016-07-23T23:10:04.837Z"}
+        ],
+"date":"2016-07-23T23:10:04.837Z","editing":{"07b12853-07e5-487f-906a-d7ae04536540":"FUTURE"}}
+---
+
+Chat message types after immutable conversion:
+(immutable.Map)
+sender_id : String
+event     : String
+date      : Date Object
+history   : immutable.Stack of immutable.Maps
+editing   : immutable.Map
+
 ###
 
 # standard non-SMC libraries
 immutable = require('immutable')
+{IS_MOBILE, isMobile} = require('./feature')
+underscore = require('underscore')
 
 # SMC libraries
-{Avatar, UsersViewingDocument} = require('./profile')
 misc = require('smc-util/misc')
 misc_page = require('./misc_page')
 {defaults, required} = misc
@@ -38,368 +71,345 @@ misc_page = require('./misc_page')
 {alert_message} = require('./alerts')
 
 # React libraries
-{React, ReactDOM, rclass, rtypes, Actions, Store, Redux}  = require('./smc-react')
+{React, ReactDOM, rclass, rtypes, Actions, Store, redux}  = require('./smc-react')
 {Icon, Loading, TimeAgo} = require('./r_misc')
-{Button, Col, Grid, Input, ListGroup, ListGroupItem, Panel, Row} = require('react-bootstrap')
+{Button, Col, Grid, FormControl, FormGroup, ListGroup, ListGroupItem, Panel, Row, ButtonGroup, Well} = require('react-bootstrap')
 
 {User} = require('./users')
 
-redux_name = (project_id, path) ->
+exports.redux_name = redux_name = (project_id, path) ->
     return "editor-#{project_id}-#{path}"
 
 class ChatActions extends Actions
+    _init: () =>
+        ## window.a = @  # for debugging
+        # be explicit about exactly what state is in the store
+        @setState
+            height             : 0          # 0 means not rendered; otherwise is the height of the chat editor
+            input              : ''         # content of the input box
+            is_preview         : undefined  # currently displaying preview of the main input chat
+            last_sent          : undefined  # last sent message
+            messages           : undefined  # immutablejs map of all messages
+            offset             : undefined  # information about where on screen the chat editor is located
+            position           : undefined  # more info about where chat editor is located
+            saved_mesg         : undefined  # I'm not sure yet (has something to do with saving an edited message)
+            use_saved_position : undefined  # whether or not to maintain last saved scroll position (used when unmounting then remounting, e.g., due to tab change)
+
+    # Initialize the state of the store from the contents of the syncdb.
+    init_from_syncdb: () =>
+        v = {}
+        for x in @syncdb.select()
+            if x.corrupt?
+                continue
+
+            switch x.event
+
+                when 'chat'
+                    if x.video_chat?.is_video_chat
+                        # discard/ignore anything related to the old old video chat approach
+                        continue
+                    if x.history
+                        x.history = immutable.Stack(immutable.fromJS(x.history))
+                    else if x.payload? # for old chats with payload: content (2014-2016)
+                        initial = immutable.fromJS
+                            content   : x.payload.content
+                            author_id : x.sender_id
+                            date      : x.date
+                        x.history = immutable.Stack([initial])
+                    else if x.mesg? # for old chats with mesg: content (up to 2014)
+                        initial = immutable.fromJS
+                            content   : x.mesg.content
+                            author_id : x.sender_id
+                            date      : x.date
+                        x.history = immutable.Stack([initial])
+                    if not x.editing
+                        x.editing = {}
+                    v[x.date - 0] = x
+
+        @setState
+            messages : immutable.fromJS(v)
+
     _syncdb_change: (changes) =>
-        m = messages = @redux.getStore(@name).get('messages')
+        messages_before = messages = @store.get('messages')
+        if not messages?
+            # Messages need not be defined when changes appear in case of problems or race.
+            return
         for x in changes
             if x.insert
-                messages = messages.set(x.insert.date - 0, immutable.fromJS(x.insert))
+                # Assumes all fields to be provided in x.insert
+                # console.log('Received', x.insert)
+                # OPTIMIZATION: make into custom conversion to immutable
+                switch x.insert.event
+
+                    when 'chat'
+                        message  = immutable.fromJS(x.insert)
+                        message  = message.set('history', immutable.Stack(immutable.fromJS(x.insert.history)))
+                        message  = message.set('editing', immutable.Map(x.insert.editing))
+                        messages = messages.set("#{x.insert.date - 0}", message)
+
             else if x.remove
-                messages = messages.delete(x.remove.date - 0)
-        if m != messages
+                if x.remove.event == 'chat'
+                    messages = messages.delete(x.remove.date - 0)
+
+        if messages_before != messages
             @setState(messages: messages)
 
     send_chat: (mesg) =>
-        mesg = misc_page.sanitize_html(mesg)
         if not @syncdb?
-            # TODO: give an error or try again later?
+            # WARNING: give an error or try again later?
             return
+        sender_id = @redux.getStore('account').get_account_id()
+        time_stamp = salvus_client.server_time()
         @syncdb.update
             set :
-                sender_id : @redux.getStore('account').get_account_id()
+                sender_id : sender_id
                 event     : "chat"
-                payload   : {content: mesg}
+                history   : [{author_id: sender_id, content:mesg, date:time_stamp}]
             where :
-                date: salvus_client.server_time()
+                date: time_stamp
+            is_equal: (a, b) => (a - 0) == (b - 0)
+
         @syncdb.save()
+        @setState(last_sent: mesg)
+
+    set_editing: (message, is_editing) =>
+        if not @syncdb?
+            # WARNING: give an error or try again later?
+            return
+        author_id = @redux.getStore('account').get_account_id()
+
+        if is_editing
+            # FUTURE: Save edit changes
+            editing = message.get('editing').set(author_id, 'FUTURE')
+        else
+            editing = message.get('editing').remove(author_id)
+
+        # console.log("Currently Editing:", editing.toJS())
+        @syncdb.update
+            set :
+                history : message.get('history').toJS()
+                editing : editing.toJS()
+            where :
+                date: message.get('date')
+            is_equal: (a, b) => (a - 0) == (b - 0)
+        @syncdb.save()
+
+    # Used to edit sent messages.
+    # Inefficient. Assumes number of edits is small.
+    send_edit: (message, mesg) =>
+        if not @syncdb?
+            # WARNING: give an error or try again later?
+            return
+        author_id = @redux.getStore('account').get_account_id()
+        # OPTIMIZATION: send less data over the network?
+        time_stamp = salvus_client.server_time()
+
+        @syncdb.update
+            set :
+                history : [{author_id: author_id, content:mesg, date:time_stamp}].concat(message.get('history').toJS())
+                editing : message.get('editing').remove(author_id).toJS()
+            where :
+                date: message.get('date')
+            is_equal: (a, b) => (a - 0) == (b - 0)
+        @syncdb.save()
+
+    set_to_last_input: =>
+        @setState(input:@store.get('last_sent'))
 
     set_input: (input) =>
         @setState(input:input)
 
-# boilerplate setting up actions, stores, sync'd file, etc.
-syncdbs = {}
-exports.init_redux = init_redux = (redux, project_id, filename) ->
-    name = redux_name(project_id, filename)
-    if redux.getActions(name)?
-        return  # already initialized
-    actions = redux.createActions(name, ChatActions)
-    store   = redux.createStore(name, {input:''})
+    saved_message: (saved_mesg) =>
+        @setState(saved_mesg:saved_mesg)
 
-    synchronized_db
+    set_is_preview: (is_preview) =>
+        @setState(is_preview:is_preview)
+
+    set_use_saved_position: (use_saved_position) =>
+        @setState(use_saved_position:use_saved_position)
+
+    save_scroll_state: (position, height, offset) =>
+        # height == 0 means chat room is not rendered
+        if height != 0
+            @setState(saved_position:position, height:height, offset:offset)
+
+
+# Set up actions, stores, syncdb, etc.  init_redux returns the name of the redux actions/store associated to this chatroom
+exports.init_redux = (path, redux, project_id) ->
+    name = redux_name(project_id, path)
+    if redux.getActions(name)?
+        return name  # already initialized
+
+    actions = redux.createActions(name, ChatActions)
+    store   = redux.createStore(name)
+
+    actions._init()
+
+    require('./syncdb').synchronized_db
         project_id    : project_id
-        filename      : filename
+        filename      : path
         sync_interval : 0
         cb            : (err, syncdb) ->
             if err
-                alert_message(type:'error', message:"unable to open #{@filename}")
-            else if not syncdb.valid_data
-                alert_message(type:'error', message:"json in #{@filename} is broken")
+                alert_message(type:'error', message:"unable to open #{@path}")
             else
-                v = {}
-                for x in syncdb.select()
-                    v[x.date - 0] = x
-                actions.setState(messages : immutable.fromJS(v))
+                actions.syncdb = syncdb
+                actions.store = store
+
+                if not syncdb.valid_data
+                    # This should never happen, but obviously it can -- just open the file and randomly edit with vim!
+                    # If there were any corrupted chats, append them as a new chat at the bottom, then delete from syncdb.
+                    ###
+                    # DISABLING THIS -- it leads to feedback loops of death.
+                    corrupted = (x.corrupt for x in syncdb.select() when x.corrupt?)
+                    actions.send_chat("Corrupted chat: " + corrupted.join('\n\n'))
+                    syncdb.delete_with_field(field:'corrupt')
+                    ###
+                    console.warn("'#{path}' contains some illegable chats -- you may need to use TimeTravel")
+                    # See https://github.com/sagemathinc/smc/issues/944 for our plan regarding making corruption impossible.
+                    # Basically, we will switch to a restricted patch format.
+
+                actions.init_from_syncdb()
                 syncdb.on('change', actions._syncdb_change)
-                store.syncdb = actions.syncdb = syncdb
+    return name
 
-Message = rclass
-    displayName: "Message"
+exports.remove_redux = (path, redux, project_id) ->
+    name = redux_name(project_id, path)
+    actions = redux.getActions(name)
+    actions?.syncdb?.destroy()
+    store = redux.getStore(name)
+    if not store?
+        return
+    delete store.state
+    # It is *critical* to first unmount the store, then the actions,
+    # or there will be a huge memory leak.
+    redux.removeStore(name)
+    redux.removeActions(name)
+    return name
 
-    propTypes:
-        # example message object
-        # {"sender_id":"f117c2f8-8f8d-49cf-a2b7-f3609c48c100","event":"chat","payload":{"content":"l"},"date":"2015-08-26T21:52:51.329Z"}
-        message    : rtypes.object.isRequired  # immutable.js message object
-        account_id : rtypes.string.isRequired
-        user_map   : rtypes.object
-        project_id : rtypes.string    # optional -- improves relative links if given
-        file_path  : rtypes.string    # optional -- (used by renderer; path containing the chat log)
-        font_size  : rtypes.number
+### Message Methods ###
+exports.newest_content = newest_content = (message) ->
+    message.get('history').peek()?.get('content') ? ''
 
-    shouldComponentUpdate: (next) ->
-        return @props.message != next.message or @props.user_map != next.user_map or @props.account_id != next.account_id
+exports.sender_is_viewer = sender_is_viewer = (account_id, message) ->
+    account_id == message.get('sender_id')
 
-    sender_is_viewer: ->
-        @props.account_id == @props.message.get('sender_id')
+exports.message_colors = (account_id, message) ->
+    if sender_is_viewer(account_id, message)
+        return {background: '#46b1f6', color: '#fff', message_class:'smc-message-from-viewer'}
+    else
+        return {background: '#efefef', color: '#000', lighten:{color:'#888'}}
 
-    get_timeago: ->
-        if @sender_is_viewer()
-            pull = "pull-right small"
-        else
-            pull = "pull-left small"
-        <div className={pull} style={color:'#888', marginTop:'2px'}>
-            <TimeAgo date={new Date(@props.message.get('date'))} />
+exports.render_timeago = (message) ->
+    <span
+        className = "pull-right small"
+        style     = {maxWidth:'20%', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'}
+        >
+        <TimeAgo date={new Date(message.get('date'))} />
+    </span>
+
+NAME_STYLE =
+    color        : "#888"
+    marginBottom : '1px'
+    marginLeft   : '10px'
+    right        : 0
+    whiteSpace   : 'nowrap'
+    overflow     : 'hidden'
+    textOverflow : 'ellipsis'    # see https://css-tricks.com/snippets/css/truncate-string-with-ellipsis/
+    position     : 'absolute'    # using the "absolute in relative" positioning trick
+    left         : 0
+    top          : 0
+
+exports.show_user_name = show_user_name = (sender_name) ->
+    <div style={position:'relative', height:'1.2em', width:'100%'}>
+        <div className={"small"} style={NAME_STYLE}>
+            {sender_name}
         </div>
+    </div>
 
-    avatar_column: ->
-        account = @props.user_map?.get(@props.message.get('sender_id'))?.toJS()
-        if account?  # TODO: do something better when we don't know the user (or when sender account_id is bogus)
-            <Col key={0} xs={1} style={{display:"inline-block", verticalAlign:"middle"}}>
-                <Avatar account={account} />
-            </Col>
+exports.is_editing = is_editing = (message, account_id) ->
+    message.get('editing').has(account_id)
 
-    content_column: ->
-        value = @props.message.get('payload')?.get('content') ? ''
-        if @sender_is_viewer()
-            color = '#f5f5f5'
-        else
-            color = '#fff'
+exports.blank_column = blank_column = ->
+    <Col key={2} xs={2} sm={2}></Col>
 
-        # smileys, just for fun.
+exports.render_markdown = render_markdown = (value, project_id, file_path, className) ->
+    # the marginBottom offsets that markdown wraps everything in a p tag
+    <div style={marginBottom:'-10px'}>
+        <Markdown value={value} project_id={project_id} file_path={file_path} className={className} />
+    </div>
+
+exports.render_history_title = render_history_title =  ->
+    <ListGroupItem style={borderRadius: '10px 10px 0px 0px', textAlign:'center', padding: '0px'}>
+        <span style={fontStyle: 'italic', fontWeight: 'bold'}>Message History</span>
+    </ListGroupItem>
+
+exports.render_history_footer = render_history_footer = ->
+    <ListGroupItem style={borderRadius: '0px 0px 10px 10px', marginBottom: '3px'}>
+    </ListGroupItem>
+
+exports.render_history = render_history = (history, user_map) ->
+    historyList = history?.pop()?.toJS()
+    for index, objects of historyList
+        value = objects.content
         value = misc.smiley
             s: value
             wrap: ['<span class="smc-editor-chat-smiley">', '</span>']
         value = misc_page.sanitize_html(value)
-
-        font_size = "#{@props.font_size}px"
-
-        <Col key={1} xs={8}>
-            <Panel style={wordWrap:"break-word"}>
-                <ListGroup fill>
-                    <ListGroupItem style={background:color; fontSize: font_size}>
-                        <Markdown value={value}
-                                  project_id={@props.project_id}
-                                  file_path={@props.file_path} />
-                    </ListGroupItem>
-                    {@get_timeago()}
-                </ListGroup>
-            </Panel>
-        </Col>
-
-    blank_column:  ->
-        <Col key={2} xs={3}></Col>
-
-    render: ->
-        cols = [ @avatar_column(), @content_column(), @blank_column()]
-        # mirror right-left for sender's view
-        if @sender_is_viewer()
-            cols = cols.reverse()
-        <Row>
-            {cols}
-        </Row>
-
-ChatLog = rclass
-    displayName: "ChatLog"
-
-    propTypes:
-        messages   : rtypes.object.isRequired   # immutable js map {timestamps} --> message.
-        user_map   : rtypes.object              # immutable js map {collaborators} --> account info
-        account_id : rtypes.string
-        project_id : rtypes.string   # optional -- used to render links more effectively
-        file_path  : rtypes.string   # optional -- ...
-        font_size  : rtypes.number
-
-    shouldComponentUpdate: (next) ->
-        return @props.messages != next.messages or @props.user_map != next.user_map or @props.account_id != next.account_id
-
-    list_messages: ->
-        v = {}
-        @props.messages.map (mesg, date) =>
-            v[date] = <Message key={date}
-                        account_id = {@props.account_id}
-                        user_map   = {@props.user_map}
-                        message    = {mesg}
-                        project_id = {@props.project_id}
-                        file_path  = {@props.file_path}
-                        font_size  = {@props.font_size}
-                      />
-        k = misc.keys(v).sort(misc.cmp_Date)
-        return (v[date] for date in k)
-
-    render: ->
-        <div>
-            {@list_messages()}
-        </div>
-
-ChatRoom = (name) -> rclass
-    displayName: "ChatRoom"
-
-    reduxProps :
-        "#{name}" :
-            messages : rtypes.immutable
-            input    : rtypes.string
-        users :
-            user_map : rtypes.immutable
-        account :
-            account_id : rtypes.string
-            font_size  : rtypes.number
-        file_use :
-            file_use : rtypes.immutable
-
-    propTypes :
-        redux       : rtypes.object
-        name        : rtypes.string.isRequired
-        project_id  : rtypes.string.isRequired
-        file_use_id : rtypes.string.isRequired
-        path        : rtypes.string
-
-    getInitialState: ->
-        input : ''
-
-    keydown : (e) ->
-        if e.keyCode==27 # ESC
-            e.preventDefault()
-            @clear_input()
-        else if e.keyCode==13 and not e.shiftKey # 13: enter key
-            @scroll_to_bottom()
-            e.preventDefault()
-            mesg = @refs.input.getValue()
-            # block sending empty messages
-            if mesg.length? and mesg.length >= 1
-                @props.redux.getActions(@props.name).send_chat(mesg)
-                @clear_input()
-
-    clear_input: ->
-        @props.redux.getActions(@props.name).set_input('')
-
-    render_input: ->
-        tip = <span>
-            You may enter (Github flavored) markdown here and include Latex mathematics in $ signs.  In particular, use # for headings, > for block quotes, *'s for italic text, **'s for bold text, - at the beginning of a line for lists, back ticks ` for code, and URL's will automatically become links.   Press shift+enter for a newline without submitting your chat.
-        </span>
-
-        return <div>
-            <Input
-                autoFocus
-                rows      = 4
-                type      = 'textarea'
-                ref       = 'input'
-                onKeyDown = {@keydown}
-                value     = {@props.input}
-                onClick   = {=>@props.redux.getActions('file_use').mark_file(@props.project_id, @props.path, 'read')}
-                onChange  = {(value)=>@props.redux.getActions(@props.name).set_input(@refs.input.getValue())}
-                />
-            <div style={marginTop: '-15px', marginBottom: '15px', color:'#666'}>
-                <Tip title='Use Markdown' tip={tip}>
-                    Shift+Enter for newline.
-                    Format using <a href='https://help.github.com/articles/markdown-basics/' target='_blank'>Markdown</a>.
-                    Emoticons: {misc.emoticons}.
-                </Tip>
+        author = misc.trunc_middle(user_map.get(objects.author_id)?.get('first_name') + ' ' + user_map.get(objects.author_id)?.get('last_name'), 20)
+        if value.trim() == ''
+            text = "Message deleted "
+        else
+            text = "Last edit "
+        <Well key={index} bsSize="small" style={marginBottom:'0px'}>
+            <div style={marginBottom: '-10px', wordWrap:'break-word'}>
+                <Markdown value={value}/>
             </div>
-        </div>
+            <div className="small">
+                {text}
+                <TimeAgo date={new Date(objects.date)} />
+                {' by ' + author}
+            </div>
+        </Well>
 
-    chat_log_style:
-        overflowY    : "auto"
-        overflowX    : "hidden"
-        height       : "60vh"
-        margin       : "0"
-        padding      : "0"
-        paddingRight : "10px"
+### ChatLog Methods ###
 
-    chat_input_style:
-        height       : "0vh"
-        margin       : "0"
-        padding      : "0"
-        marginTop    : "5px"
+exports.get_user_name = get_user_name = (account_id, user_map) ->
+    account = user_map?.get(account_id)
+    if account?
+        account_name = account.get('first_name') + ' ' + account.get('last_name')
+    else
+        account_name = "Unknown"
 
-    scroll_to_bottom: ->
-        if not @refs.log_container?
-            @_scrolled = false
-            return
-        node = ReactDOM.findDOMNode(@refs.log_container)
+### ChatRoom Methods ###
+exports.send_chat = send_chat = (e, log_container, mesg, actions) ->
+    scroll_to_bottom(log_container, actions)
+    e.preventDefault()
+    # block sending empty messages
+    if mesg.length? and mesg.trim().length >= 1
+        actions.send_chat(mesg)
+        clear_input(actions)
+
+exports.clear_input = clear_input = (actions) ->
+    actions.set_input('')
+
+exports.is_at_bottom = is_at_bottom = (saved_position, offset, height) ->
+    # 20 for covering margin of bottom message
+    saved_position + offset + 20 > height
+
+exports.scroll_to_bottom = scroll_to_bottom = (log_container, actions) ->
+    if log_container?
+        node = ReactDOM.findDOMNode(log_container)
         node.scrollTop = node.scrollHeight
-        @_ignore_next_scroll = true
-        @_scrolled = false
+        actions.save_scroll_state(node.scrollTop, node.scrollHeight, node.offsetHeight)
+        actions.set_use_saved_position(false)
 
-    on_scroll: (e) ->
-        if @_ignore_next_scroll
-            @_ignore_next_scroll = false
-            return
-        @_scrolled = true
-        e.preventDefault()
-
-    componentDidMount: ->
-        if not @_scrolled
-            @scroll_to_bottom()
-
-    componentDidUpdate: ->
-        if not @_scrolled
-            @scroll_to_bottom()
-
-    show_files : ->
-        @props.redux?.getProjectActions(@props.project_id).set_focused_page('project-file-listing')
-
-    show_timetravel: ->
-        @props.redux?.getProjectActions(@props.project_id).open_file
-            path               : misc.history_path(@props.path)
-            foreground         : true
-            foreground_project : true
-
-    render : ->
-        if not @props.messages? or not @props.redux?
-            return <Loading/>
-        <Grid>
-            <Row style={marginBottom:'5px'}>
-                <Col xs={4}>
-                    <Button className='smc-small-only' bsSize='large'
-                            onClick={@show_files}><Icon name='toggle-up'/> Files
-                    </Button>
-                </Col>
-                <Col xs={4}>
-                    <div style={float:'right'}>
-                        <UsersViewingDocument
-                              file_use_id = {@props.file_use_id}
-                              file_use    = {@props.file_use}
-                              account_id  = {@props.account_id}
-                              user_map    = {@props.user_map} />
-                    </div>
-                </Col>
-                <Col xs={4}>
-                    <Button onClick={@show_timetravel} bsStyle='info' style={float:'right'}>
-                        <Icon name='history'/> TimeTravel
-                    </Button>
-                </Col>
-            </Row>
-            <Row>
-                <Col md={12}>
-                    <Panel style={@chat_log_style} ref='log_container' onScroll={@on_scroll} >
-                        <ChatLog
-                            messages     = {@props.messages}
-                            account_id   = {@props.account_id}
-                            user_map     = {@props.user_map}
-                            project_id   = {@props.project_id}
-                            font_size    = {@props.font_size}
-                            file_path    = {if @props.path? then misc.path_split(@props.path).head} />
-                    </Panel>
-                </Col>
-            </Row>
-            <Row>
-                <Col md={12}>
-                    <div style={@chat_input_style}>
-                        {@render_input()}
-                    </div>
-                </Col>
-            </Row>
-        </Grid>
-
-# boilerplate fitting this into SMC below
-
-render = (redux, project_id, path) ->
-    name = redux_name(project_id, path)
-    file_use_id = require('smc-util/schema').client_db.sha1(project_id, path)
-    C = ChatRoom(name)
-    <Redux redux={redux}>
-        <C redux={redux} name={name} project_id={project_id} path={path} file_use_id={file_use_id} />
-    </Redux>
-
-exports.render = (project_id, path, dom_node, redux) ->
-    init_redux(redux, project_id, path)
-    ReactDOM.render(render(redux, project_id, path), dom_node)
-
-exports.hide = (project_id, path, dom_node, redux) ->
-    ReactDOM.unmountComponentAtNode(dom_node)
-
-exports.show = (project_id, path, dom_node, redux) ->
-    ReactDOM.render(render(redux, project_id, path), dom_node)
-
-exports.free = (project_id, path, dom_node, redux) ->
-    fname = redux_name(project_id, path)
-    store = redux.getStore(fname)
-    if not store?
-        return
-    ReactDOM.unmountComponentAtNode(dom_node)
-    store.syncdb?.destroy()
-    delete store.state
-    # It is *critical* to first unmount the store, then the actions,
-    # or there will be a huge memory leak.
-    redux.removeStore(fname)
-    redux.removeActions(fname)
-
+exports.scroll_to_position = scroll_to_position = (log_container, saved_position, offset, height, use_saved_position, actions) ->
+    if log_container?
+        actions.set_use_saved_position(not is_at_bottom(saved_position, offset, height))
+        node = ReactDOM.findDOMNode(log_container)
+        if use_saved_position
+            node.scrollTop = saved_position
+        else
+            scroll_to_bottom(log_container, actions)
 

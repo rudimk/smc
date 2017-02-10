@@ -2,7 +2,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2014, William Stein
+#    Copyright (C) 2014 -- 2016, SageMath, Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -20,16 +20,16 @@
 ###############################################################################
 
 
-###########################################################
+###############################################################################
 #
 # This should be the last code run on client application startup.
 #
-###########################################################
+###############################################################################
 
-{top_navbar} = require('./top_navbar')
-top_navbar.hide_page_button("projects")
+$               = window.$
 {salvus_client} = require('./salvus_client')
-$ = require("jquery")
+{redux}         = require('./smc-react')
+misc            = require('smc-util/misc')
 
 # see http://stackoverflow.com/questions/12197122/how-can-i-prevent-a-user-from-middle-clicking-a-link-with-javascript-or-jquery
 # I have some concern about performance.
@@ -37,38 +37,43 @@ $(document).on "click", (e) ->
     if e.button == 1 and $(e.target).hasClass("salvus-no-middle-click")
         e.preventDefault()
         e.stopPropagation() # ?
+    # hide popover on click
+    if $(e.target).data('toggle') != 'popover' and $(e.target).parents('.popover.in').length == 0
+        $('[data-toggle="popover"]').popover('hide')
 
 remember_me = salvus_client.remember_me_key()
-if window.smc_target and not localStorage[remember_me] and window.smc_target != 'login'
+if window.smc_target and not misc.get_local_storage(remember_me) and window.smc_target != 'login'
     require('./history').load_target(window.smc_target)
 else
-    top_navbar.switch_to_page('account')
+    redux.getActions('page').set_active_tab('account')
 
-client = window.smc.client
+
+client = salvus_client
 if client._connected
-    # These events below currently (do to not having finished the react rewrite)
+    # These events below currently (due to not having finished the react rewrite)
     # have to be emited after the page loads, but may happen before.
     client.emit('connected')
     if client._signed_in
         client.emit("signed_in", client._sign_in_mesg)
 
-###
 # mathjax configuration: this could be cleaned up further or even parameterized with some code during startup
-# the essential step is at the bottom below: MathJax.Hub.Configured()
-# TODO: this doesn't work, because parts of the SMC app require MathJax during startup to be already there.
 
-window.MathJax =
-   skipStartupTypeset: true
-   extensions: ["tex2jax.js","asciimath2jax.js"]  # "static/mathjax_extensions/xypic.js"
-   jax: ["input/TeX","input/AsciiMath", "output/SVG"]
-   tex2jax:
-      inlineMath: [ ['$','$'], ["\\(","\\)"] ]
-      displayMath: [ ['$$','$$'], ["\\[","\\]"] ]
-      processEscapes: true
+# ATTN: do not use "xypic.js", frequently causes crash!
+window.MathJax = exports.MathJaxConfig =
+    skipStartupTypeset: true
+    extensions: ["tex2jax.js","asciimath2jax.js"]  # "static/mathjax_extensions/xypic.js"
+    jax: ["input/TeX","input/AsciiMath", "output/SVG"]
+    # http://docs.mathjax.org/en/latest/options/tex2jax.html
+    tex2jax:
+        inlineMath: [ ['$','$'], ["\\(","\\)"] ]
+        displayMath: [ ['$$','$$'], ["\\[","\\]"] ]
+        processEscapes: true
+        ignoreClass: "tex2jax_ignore"
+        skipTags: ["script","noscript","style","textarea","pre","code"]
 
-   TeX:
-       extensions: ["autoload-all.js"]
-       Macros:  # get these from sage/misc/latex.py
+    TeX:
+        extensions: ["autoload-all.js"]
+        Macros:  # get these from sage/misc/latex.py
             Bold:  ["\\mathbb{#1}",1]
             ZZ:    ["\\Bold{Z}",0]
             NN:    ["\\Bold{N}",0]
@@ -89,18 +94,35 @@ window.MathJax =
             Qp:    ["\\QQ_{#1}",1]
             Zmod:  ["\\ZZ/#1\\ZZ",1]
 
-   # do not use "xypic.js", frequently causes crash!
-   "HTML-CSS":
-        linebreaks: { automatic: true }
-   SVG:
-        linebreaks: { automatic: true }
-   showProcessingMessages: false
-###
+    # do not use "xypic.js", frequently causes crash!
+    "HTML-CSS":
+        linebreaks:
+            automatic: true
+    SVG:
+        linebreaks:
+            automatic: true
+    showProcessingMessages: false
 
-$ = require("jquery")
+$ = window.$
 $ ->
     $("#smc-startup-banner")?.remove()
     $('#smc-startup-banner-status')?.remove()
     $(parent).trigger('initialize:frame')
-    # $.getScript "#{MATHJAX_URL}?delayStartupUntil=configured", ->
-    MathJax.Hub.Configured()
+
+    # dynamically inserting the mathjax script URL
+    mjscript = document.createElement("script")
+    mjscript.type = "text/javascript"
+    mjscript.src  = MATHJAX_URL
+    mjscript.onload = ->
+        {mathjax_finish_startup} = require('./misc_page')
+        MathJax.Hub?.Queue([mathjax_finish_startup])
+    document.getElementsByTagName("head")[0].appendChild(mjscript)
+
+    # hsy: showing firefox warning on all platforms (no idea why MacIntel was excluded)
+    if $.browser.firefox    # and window.navigator.platform != "MacIntel"
+        # See https://github.com/sagemathinc/smc/issues/1314
+        {alert_message} = require('./alerts')
+        alert_message
+            type    : 'info'
+            message : "There are major performance issues with Firefox and SageMathCloud due to bugs in Firefox.  We strongly recommend using Chrome, Safari, or Edge."
+            timeout : 120

@@ -1,5 +1,9 @@
 ###
 
+** Deprecated: THIS WAS tons of work, but really Kubernetes is the way to go... **
+
+---
+
 g = require('./smc_gcloud.coffee').gcloud(db:require('rethink').rethinkdb(hosts:'db0', pool:1))
 
 This uses the official node.js driver, which is pretty good now, and seems an order
@@ -29,7 +33,11 @@ Rules we care about are:
      stop the VM and recreate and start it as prempt.
 
 ###
+fs = require('fs')
+
+
 winston     = require('winston')
+
 winston.remove(winston.transports.Console)
 winston.add(winston.transports.Console, {level: 'debug', timestamp:true, colorize:true})
 
@@ -1123,6 +1131,14 @@ class Bucket
         @_bucket = @gcloud._gcloud.storage().bucket(@name)
 
     dbg: (f) -> @gcloud.dbg("Bucket.#{f}")
+
+    delete: (opts) =>
+        opts = defaults opts,
+            name    : required
+            cb      : undefined
+        dbg = @dbg("delete(name='#{opts.name}')")
+        dbg()
+        @_bucket.file(opts.name).delete (err) => opts.cb?(err)
 
     write: (opts) =>
         opts = defaults opts,

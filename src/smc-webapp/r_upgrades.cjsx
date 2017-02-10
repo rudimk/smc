@@ -2,7 +2,6 @@
 {Loading, r_join, Space, Footer} = require('./r_misc')
 misc = require('smc-util/misc')
 {Button, Row, Col, Well, Panel, ProgressBar} = require('react-bootstrap')
-{ProjectTitle} = require('./projects')
 {HelpEmailLink, SiteName, PolicyPricingPageUrl} = require('./customize')
 
 {PROJECT_UPGRADES} = require('smc-util/schema')
@@ -135,6 +134,7 @@ exports.UpgradesPage = rclass
         return r_join(v)
 
     render_upgraded_project: (project_id, upgrades, darker) ->
+        {ProjectTitle} = require('./projects')
         <Row key={project_id} style={backgroundColor:'#eee' if darker}>
             <Col sm=4>
                 <ProjectTitle
@@ -147,6 +147,7 @@ exports.UpgradesPage = rclass
                 {@render_upgrades_to_project(project_id, upgrades)}
             </Col>
         </Row>
+
 
     render_upgraded_projects_rows: (upgraded_projects) ->
         i = -1
@@ -170,7 +171,7 @@ exports.UpgradesPage = rclass
             {@render_upgraded_projects_rows(upgraded_projects)}
         </Panel>
 
-    render : ->
+    render: ->
         if not @props.redux? or not @props.project_map?
             return <Loading />
         if not @props.stripe_customer?.subscriptions?.total_count

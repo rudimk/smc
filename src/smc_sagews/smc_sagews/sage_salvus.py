@@ -5,7 +5,7 @@
 ##################################################################################
 
 #########################################################################################
-#       Copyright (C) 2013 William Stein <wstein@gmail.com>                             #
+#       Copyright (C) 2016, Sagemath Inc.
 #                                                                                       #
 #  Distributed under the terms of the GNU General Public License (GPL), version 2+      #
 #                                                                                       #
@@ -13,7 +13,7 @@
 #########################################################################################
 
 
-import copy, os, sys, types
+import copy, os, sys, types, re
 
 try:
     from pandas import DataFrame
@@ -28,6 +28,11 @@ except:
 sys.path.append('.')
 
 salvus = None
+def set_salvus(salvus_obj):
+    global salvus
+    salvus = salvus_obj
+    import sage_jupyter
+    sage_jupyter.salvus = salvus_obj
 
 import json
 from uuid import uuid4
@@ -73,7 +78,7 @@ class InteractCell(object):
         - ``update_args`` -- (default: None) only call f if one of the args in
           this list of strings changes.
         - ``auto_update`` -- (default: True) call f every time an input changes
-          (or one of the argus in update_args).
+          (or one of the arguments in update_args).
         - ``flicker`` -- (default: False) if False, the output part of the cell
           never shrinks; it can only grow, which aleviates flicker.
         - ``output`` -- (default: True) if False, do not automatically
@@ -393,6 +398,13 @@ class Interact(object):
             else:
                 del interact.is_prime
 
+    We illustrate not automatically updating the function until a
+    button is pressed::
+
+        @interact(auto_update=False)
+        def f(a=True, b=False):
+            print a, b
+
     You can access the value of a control associated to a variable foo
     that you create using interact.foo, and check whether there is a
     control associated to a given variable name using hasattr::
@@ -503,7 +515,7 @@ class control:
         try:
             return self._convert_to_client(value)
         except Exception as err:
-            sys.stderr.write("%s -- %s\n"%(err, self))
+            sys.stderr.write("convert_to_client: %s -- %s\n"%(err, self))
             sys.stderr.flush()
             return jsonable(value)
 
@@ -579,6 +591,8 @@ def automatic_control(default):
         return default
     elif isinstance(default, str):
         return input_box(default, label=label, type=str)
+    elif isinstance(default, unicode):
+        return input_box(default, label=label, type=unicode)
     elif isinstance(default, bool):
         return checkbox(default, label=label)
     elif isinstance(default, list):
@@ -611,19 +625,25 @@ def interact_control(arg, value):
     c._opts['var'] = arg
     return c
 
-def sage_eval(x, locals=None):
-    x = str(x).strip()
-    if x.isspace():
-        return None
+def sage_eval(x, locals=None, **kwds):
+    if isinstance(x, str):
+        x = str(x).strip()
+        if x.isspace():
+            return None
     from sage.all import sage_eval
-    return sage_eval(x, locals=locals)
+    return sage_eval(x, locals=locals, **kwds)
 
 class ParseValue:
     def __init__(self, type):
         self._type = type
 
     def _eval(self, value):
-        return sage_eval(value, locals=None if salvus is None else salvus.namespace)
+        if isinstance(value, (str, unicode)):
+            if not value:
+                return ''
+            return sage_eval(value, locals=None if salvus is None else salvus.namespace)
+        else:
+            return value
 
     def __call__(self, value):
         from sage.all import Color
@@ -631,6 +651,8 @@ class ParseValue:
             return self._eval(value)
         elif self._type is str:
             return str(value)
+        elif self._type is unicode:
+            return unicode(value)
         elif self._type is Color:
             try:
                 return Color(value)
@@ -1155,8 +1177,7 @@ except:
 
 class HTML:
     """
-    Cell mode that renders everything after %html as HTML then hides
-    the input (unless you pass in hide=False).
+    Cell mode that renders everything after %html as HTML
 
     EXAMPLES::
 
@@ -1166,7 +1187,7 @@ class HTML:
         <h2>Subtitle</h2>
 
         ---
-        %html(hide=False)
+        %html(hide=True)
         <h1>A Title</h1>
         <h2>Subtitle</h2>
 
@@ -1177,7 +1198,7 @@ class HTML:
         %html(hide=False) <h1>Title</h1>
 
     """
-    def __init__(self, hide=True):
+    def __init__(self, hide=False):
         self._hide = hide
 
     def __call__(self, *args, **kwds):
@@ -1193,8 +1214,52 @@ class HTML:
             salvus.hide('input')
         salvus.html(s)
 
-    def table(self):
-        raise NotImplementedError("html.table not implemented in SageMathCloud yet")
+    def table(self, rows = None, header=False):
+        """
+        Renders a given matrix or nested list as an HTML table.
+
+        Arguments::
+
+        * **rows**: the rows of the table as a list of lists
+        * **header**: if True, the first row is formatted as a header (default: False)
+        """
+        # TODO: support columns as in http://doc.sagemath.org/html/en/reference/misc/sage/misc/table.html
+        assert rows is not None, '"rows" is a mandatory argument, should be a list of lists'
+
+        from sage.matrix.matrix import is_Matrix
+        import numpy as np
+
+        if is_Matrix(rows):
+            table = list(rows) # list of Sage Vectors
+        elif isinstance(rows, np.ndarray):
+            table = rows.tolist()
+        else:
+            table = rows
+
+        assert isinstance(table, (tuple, list)), '"rows" must be a list of lists'
+
+        def as_unicode(s):
+            '''
+            This not only deals with unicode strings, but also converts e.g. `Integer` objects to a str
+            '''
+            if not isinstance(s, unicode):
+                try:
+                    return unicode(s, 'utf8')
+                except:
+                    return unicode(str(s), 'utf8')
+            return s
+
+        def mk_row(row, header=False):
+            is_vector = hasattr(row, 'is_vector') and row.is_vector()
+            assert isinstance(row, (tuple, list)) or is_vector, '"rows" must contain lists or vectors for each row'
+            tag = 'th' if header else 'td'
+            row = [u'<{tag}>{}</{tag}>'.format(as_unicode(_), tag = tag) for _ in row]
+            return u'<tr>{}</tr>'.format(u''.join(row))
+
+        thead = u'<thead>{}</thead>'.format(mk_row(table.pop(0), header=True)) if header else ''
+        h_rows = [mk_row(row) for row in table]
+        html_table = u'<table style="width: auto;" class="table table-bordered">{}<tbody>{}</tbody></table>'
+        self(html_table.format(thead, ''.join(h_rows)))
 
 html = HTML()
 html.iframe = _html.iframe  # written in a way that works fine
@@ -1423,7 +1488,7 @@ class Time:
 
     def after(self, code):
         from sage.all import walltime, cputime
-        print("CPU time: %.2f s, Wall time: %.2f s" % (cputime(self._start_cputime), walltime(self._start_walltime)))
+        print("\nCPU time: %.2f s, Wall time: %.2f s" % (cputime(self._start_cputime), walltime(self._start_walltime)))
         self._start_cputime = self._start_walltime = None
 
     def __call__(self, code):
@@ -1585,6 +1650,9 @@ class Capture:
     def __call__(self, code=None, stdout=None, stderr=None, append=False, echo=False):
         if code is None:
             return Capture(stdout=stdout, stderr=stderr, append=append, echo=echo)
+        if salvus._prefix:
+            if not code.startswith("%"):
+                code = salvus._prefix + '\n' + code
         salvus.execute(code)
 
 
@@ -1595,6 +1663,7 @@ class Capture:
 
 capture = Capture(stdout=None, stderr=None, append=False, echo=False)
 
+import sage.misc.cython
 
 def cython(code=None, **kwds):
     """
@@ -1629,7 +1698,6 @@ def cython(code=None, **kwds):
     if 'annotate' not in kwds and not silent:
         kwds['annotate'] = True
 
-    import sage.misc.cython
     modname, path = sage.misc.cython.cython(filename, **kwds)
 
     try:
@@ -1730,7 +1798,7 @@ def python(code):
     """
     salvus.execute(code, preparse=False)
 
-def python3(code):
+def python3(code=None,**kwargs):
     """
     Block decorator to run code in a pure Python3 mode session.
 
@@ -1749,9 +1817,40 @@ def python3(code):
     Afterwards, p3 contains the output '{1, 2, 3}' and the variable x
     in the controlling Sage session is in no way impacted.
 
-    NOTE: No state is preserved between calls.  Each call is a separate process.
+    .. note::
+
+        State is preserved between cells.
+        SMC %python3 mode uses the jupyter `anaconda3` kernel.
     """
-    script('sage-native-execute python3 -E')(code)
+    if python3.jupyter_kernel is None:
+        python3.jupyter_kernel = jupyter("anaconda3")
+    return python3.jupyter_kernel(code,**kwargs)
+python3.jupyter_kernel = None
+
+def singular_kernel(code=None,**kwargs):
+    """
+    Block decorator to run code in a Singular mode session.
+
+    To use this, put %singular_kernel by itself in a cell so that it applies to
+    the rest of the cell, or put it at the beginning of a line to
+    run just that line using singular_kernel.
+
+    State is preserved between cells.
+
+    This is completely different than the singular command in Sage itself, which
+    supports things like x = singular(sage_object), and *also* provides a way
+    to execute code by beginning cells with %singular. The singular interface in
+    Sage uses pexpect, so might be less robust than singular_kernel.
+
+    .. note::
+
+        SMC %singular_kernel mode uses the jupyter `singular` kernel:
+        https://github.com/sebasguts/jupyter_kernel_singular
+    """
+    if singular_kernel.jupyter_kernel is None:
+        singular_kernel.jupyter_kernel = jupyter("singular")
+    return singular_kernel.jupyter_kernel(code,**kwargs)
+singular_kernel.jupyter_kernel = None
 
 def perl(code):
     """
@@ -1937,10 +2036,10 @@ def fortran(x, library_paths=[], libraries=[], verbose=False):
         if k[0] != '_':
             salvus.namespace[k] = x
 
-
-def sh(code):
+def sh(code=None,**kwargs):
     """
-    Run a bash script in Salvus.
+    Run a bash script in Salvus. Uses jupyter bash kernel
+    which allows keeping state between cells.
 
     EXAMPLES:
 
@@ -1965,63 +2064,107 @@ def sh(code):
         %sh pwd
 
     After that, the variable output contains the current directory
+
+    Remember shell state between cells
+
+        %sh
+        FOO='xyz'
+        cd /tmp
+        ... new cell will show settings from previous cell ...
+        %sh
+        echo $FOO
+        pwd
+
+    Display image file (this is a feature of jupyter bash kernel)
+
+        %sh
+        display < sage_logo.png
+
+    .. WARNING::
+
+        The jupyter bash kernel does not separate stdout and stderr as cell is running.
+        It only returns ok or error depending on exit status of last command in the cell.
+        So all cell output captured goes to either stdout or stderr variable, depending
+        on exit status of the last command in the %sh cell.
     """
-    return script('/bin/bash')(code)
+    if sh.jupyter_kernel is None:
+        sh.jupyter_kernel = jupyter("bash")
+        sh.jupyter_kernel('function command_not_found_handle { printf "%s: command not found\n" "$1" >&2; return 127;}')
+    return sh.jupyter_kernel(code,**kwargs)
+sh.jupyter_kernel = None
 
-# Monkey patch the R interpreter interface to support graphics, when
-# used as a decorator.
+# use jupyter kernel for GNU octave instead of sage interpreter interface
+def octave(code=None,**kwargs):
+    r"""
+    Run GNU Octave code in a sage worksheet.
 
-import sage.interfaces.r
-def r_eval0(*args, **kwds):
-    return sage.interfaces.r.R.eval(sage.interfaces.r.r, *args, **kwds).strip('\n')
+    INPUT:
 
-_r_plot_options = ''
-def set_r_plot_options(width=7, height=7):
-    global _r_plot_options
-    _r_plot_options = ", width=%s, height=%s"%(width, height)
+    - ``code`` -- a string containing code
 
-r_dev_on = False
-def r_eval(code, *args, **kwds):
+    Use as a decorator. For example, put this in a cell and evaluate it::
+
+        %octave
+        x = -10:0.1:10;
+        plot (x, sin (x))
+
+    .. note::
+
+        SMC %octave mode uses the jupyter `octave` kernel.
     """
-    Run a block of R code.
+    if octave.jupyter_kernel is None:
+        octave.jupyter_kernel = jupyter("octave")
+        octave.jupyter_kernel.smc_image_scaling = 1
+    return octave.jupyter_kernel(code,**kwargs)
+octave.jupyter_kernel = None
 
-    EXAMPLES::
+# jupyter kernel for %ir mode
+def r(code=None,**kwargs):
+    r"""
+    Run R code in a sage worksheet.
 
-         sage: print r.eval("summary(c(1,2,3,111,2,3,2,3,2,5,4))")   # outputs a string
-         Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
-         1.00    2.00    3.00   12.55    3.50  111.00
+    INPUT:
 
-    In the notebook, you can put %r at the top of a cell, or type "%default_mode r" into
-    a cell to set the whole worksheet to r mode.
+    - ``code`` -- a string containing code
 
-    NOTE: Any plots drawn using the plot command should "just work", without having
-    to mess with special devices, etc.
+    Use as a decorator. For example, put this in a cell and evaluate it to see a scatter plot
+    of built-in mtcars dataframe variables `mpg` vs `wt`::
+
+        %r
+        with(mtcars,plot(wt,mpg))
+
+    .. note::
+
+        SMC %r mode uses the jupyter `ir` kernel.
     """
-    # Only use special graphics support when using r as a cell decorator, since it has
-    # a 10ms penalty (factor of 10 slowdown) -- which doesn't matter for interactive work, but matters
-    # a lot if one had a loop with r.eval in it.
-    if sage.interfaces.r.r not in salvus.code_decorators:
-        return r_eval0(code, *args, **kwds)
+    if r.jupyter_kernel is None:
+        r.jupyter_kernel = jupyter("ir")
+        r.jupyter_kernel('options(repr.plot.res = 240)')
+        r.jupyter_kernel.smc_image_scaling = .5
+    return r.jupyter_kernel(code,**kwargs)
+r.jupyter_kernel = None
 
-    global r_dev_on
-    if r_dev_on:
-        return r_eval0(code, *args, **kwds)
-    try:
-        r_dev_on = True
-        tmp = '/tmp/' + uuid() + '.svg'
-        r_eval0("svg(filename='%s'%s)"%(tmp, _r_plot_options))
-        s = r_eval0(code, *args, **kwds)
-        r_eval0('dev.off()')
-        return s
-    finally:
-        r_dev_on = False
-        if os.path.exists(tmp):
-            salvus.stdout('\n'); salvus.file(tmp, show=True); salvus.stdout('\n')
-            os.unlink(tmp)
+# jupyter kernel for %scala mode
+def scala211(code=None,**kwargs):
+    r"""
+    Run scala code in a sage worksheet.
 
-sage.interfaces.r.r.eval = r_eval
-sage.interfaces.r.r.set_plot_options = set_r_plot_options
+    INPUT:
 
+    - ``code`` -- a string containing code
+
+    Use as a decorator.
+
+    .. note::
+
+        SMC %scala211 mode uses the jupyter `scala211` kernel.
+    """
+    if scala211.jupyter_kernel is None:
+        scala211.jupyter_kernel = jupyter("scala211")
+    return scala211.jupyter_kernel(code,**kwargs)
+scala211.jupyter_kernel = None
+# add alias for generic scala
+scala = scala211
 
 def prun(code):
     """
@@ -2353,7 +2496,11 @@ def show(*objs, **kwds):
        - svg: (default: True); if True, show 2d plots using svg (otherwise use png)
 
        - d3: (default: True); if True, show graphs (vertices and edges) using an interactive D3 viewer
-           for the many options for this viewer, type 'import graphics; graphics.graph_to_d3_jsonable?'
+         for the many options for this viewer, type
+
+             import smc_sagews.graphics
+             smc_sagews.graphics.graph_to_d3_jsonable?
+
          If false, graphs are converted to plots and displayed as usual.
 
        - renderer: (default: 'webgl'); for 3d graphics
@@ -2467,16 +2614,27 @@ def show(*objs, **kwds):
                 # better than nothing.
                 sage.misc.latex.latex.eval(s)
                 return ''
+            elif r'\begin{tabular}' in s:
+                # tabular is an environment for text, not formular.
+                # Sage's `tabular` should actually use \array!
+                sage.misc.latex.latex.eval(s)
+                return ''
+            # default
             elif display:
                 return "$\\displaystyle %s$"%s
             else:
                 return "$%s$"%s
+    sys.stdout.flush()
+    sys.stderr.flush()
     s = show0(objs, combine_all=True)
     if s is not None:
-        if display:
-            salvus.html("<div align='center'>%s</div>"%cgi.escape(s))
-        else:
-            salvus.html("<div>%s</div>"%cgi.escape(s))
+        if len(s) > 0:
+            if display:
+                salvus.html("<div align='center'>%s</div>"%cgi.escape(s))
+            else:
+                salvus.html("<div>%s</div>"%cgi.escape(s))
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 # Make it so plots plot themselves correctly when they call their repr.
 Graphics.show = show
@@ -2903,6 +3061,10 @@ def reset(vars=None, attached=False):
     sage.misc.reset.reset_interfaces()
     if attached:
         sage.misc.reset.reset_attached()
+    # reset() adds 'pretty_print' and 'view' to show_identifiers()
+    # user can shadow these and they will appear in show_identifiers()
+    # 'sage_salvus' is added when the following line runs; user may not shadow it
+    exec('sage.misc.session.state_at_init = dict(globals())',salvus.namespace)
 
 reset.__doc__ += sage.misc.reset.reset.__doc__
 
@@ -2947,7 +3109,7 @@ def md2html(s):
 # NOTE: this is not used anymore
 class Markdown(object):
     r"""
-    Cell mode that renders everything after %md as markdown and hides the input by default.
+    Cell mode that renders everything after %md as markdown.
 
     EXAMPLES::
 
@@ -2958,17 +3120,17 @@ class Markdown(object):
         ## A subheading
 
         ---
-        %md(hide=False)
+        %md(hide=True)
         # A title
 
         - a list
 
         ---
-        md("# A title", hide=False)
+        md("# A title")
 
 
         ---
-        %md(hide=False) `some code`
+        %md `some code`
 
 
     This uses the Python markdown2 library with the following
@@ -2982,7 +3144,7 @@ class Markdown(object):
     typeset if it is wrapped in $'s and $$'s, \(, \), \[, \],
     \begin{equation}, \end{equation}, \begin{align}, \end{align}.,
     """
-    def __init__(self, hide=True):
+    def __init__(self, hide=False):
         self._hide = hide
 
     def __call__(self, *args, **kwds):
@@ -3032,7 +3194,7 @@ class Marked(object):
         %md(hide=False) `some code`
 
     """
-    def __init__(self, hide=True):
+    def __init__(self, hide=False):
         self._hide = hide
 
     def __call__(self, *args, **kwds):
@@ -3052,6 +3214,9 @@ md = Marked()
 
 #####
 ## Raw Input
+# - this is the Python 2.x interpretation.  In Python 3.x there is no raw_input,
+# and raw_input is renamed input (to cause more confusion).
+#####
 def raw_input(prompt='', default='', placeholder='', input_width=None, label_width=None, type=None):
     """
     Read a string from the user in the worksheet interface to Sage.
@@ -3073,11 +3238,26 @@ def raw_input(prompt='', default='', placeholder='', input_width=None, label_wid
     - By default, returns a **unicode** string (not a normal Python str). However, can be customized
       by changing the type.
 
-    EXAMPLE:
+    EXAMPLE::
 
-        print(salvus.raw_input("What is your full name?", default="Sage Math", input_width="20ex", label_width="15ex"))
+         print(raw_input("What is your full name?", default="Sage Math", input_width="20ex", label_width="25ex"))
+
     """
     return salvus.raw_input(prompt=prompt, default=default, placeholder=placeholder, input_width=input_width, label_width=label_width, type=type)
+
+def input(*args, **kwds):
+    """
+    Read a string from the user in the worksheet interface to Sage and return evaluated object.
+
+    Type raw_input? for more help; this function is the same as raw_input, except with type='sage'.
+
+    EXAMPLE::
+
+         print(type(input("What is your age", default=18, input_width="20ex", label_width="25ex")))
+
+    """
+    kwds['type'] = 'sage'
+    return raw_input(*args, **kwds)
 
 #####
 ## Clear
@@ -3168,12 +3348,53 @@ def load_html_resource(filename):
     if ext == "css":
         salvus.javascript('''$.get("%s", function(css) { $('<style type=text/css></style>').html(css).appendTo("body")});'''%url)
     elif ext == "html":
-        # TODO: opts.element should change to cell.element when more canonical (need to finish some code in syncdoc)!
-        salvus.javascript('opts.element.append($("<div>").load("%s"))'%url)
+        salvus.javascript('element.append($("<div>").load("%s"))'%url)
     elif ext == "coffee":
-        salvus.javascript('$.ajax({url:"%s"}).done(function(data) { eval(CoffeeScript.compile(data)); })'%url)
+        salvus.coffeescript('$.ajax({url:"%s"}).done (data) ->\n  eval(CoffeeScript.compile(data))'%url)
     elif ext == "js":
         salvus.html('<script src="%s"></script>'%url)
+
+try:
+    from sage.repl.attach import load_attach_path, modified_file_iterator
+    def attach(*args):
+        r"""
+        Load file(s) into the Sage worksheet process and add to list of attached files.
+        All attached files that have changed since they were last loaded are reloaded
+        the next time a worksheet cell is executed.
+
+        INPUT:
+
+        - ``files`` - list of strings, filenames to attach
+
+        .. SEEALSO::
+
+            :meth:`sage.repl.attach.attach` docstring has details on how attached files
+            are handled
+        """
+        # can't (yet) pass "attach = True" to load(), so do this
+
+        if len(args) == 1:
+            if isinstance(args[0], (unicode,str)):
+                args = tuple(args[0].replace(',',' ').split())
+            if isinstance(args[0], (list, tuple)):
+                args = args[0]
+
+        for fname in args:
+            for path in load_attach_path():
+                fpath = os.path.join(path, fname)
+                fpath = os.path.expanduser(fpath)
+                if os.path.isfile(fpath):
+                    load(fname)
+                    sage.repl.attach.add_attached_file(fpath)
+                    break
+            else:
+                raise IOError('did not find file %r to attach' % fname)
+except ImportError:
+    print("sage_salvus: attach not available")
+    def attach(*args):
+        sys.stderr.write("Error: The 'attach' functionality is not available.\n")
+        sys.stderr.flush()
+
 
 # Monkey-patched the load command
 def load(*args, **kwds):
@@ -3201,12 +3422,15 @@ def load(*args, **kwds):
     into the web browser DOM (or Javascript session), not the Python process.
 
     If you load a pdf, it is displayed in the output of the worksheet.  The extra
-    options are passed to salvus.pdf -- see the docstring for that.
+    options are passed to smc.pdf -- see the docstring for that.
 
-    In SageMathCloud you may also use load as a decorator, with filenames separated
-    by whitespace or commas::
+    In SageMathCloud you may also use load as a decorator, with exactly one filename as input::
 
-        %load foo.sage  bar.py  a.pyx, b.pyx
+        %load foo.sage
+
+    This loads a single file whose name has a space in it::
+
+        %load a b.sage
 
     The following are all valid ways to use load::
 
@@ -3214,16 +3438,15 @@ def load(*args, **kwds):
         %load a.css
         %load a.js
         %load a.coffee
-        %load a.css a.js a.coffee a.html
+        %load a.css
         load('a.css', 'a.js', 'a.coffee', 'a.html')
-        load('a.css a.js a.coffee a.html')
         load(['a.css', 'a.js', 'a.coffee', 'a.html'])
 
     ALIAS: %runfile is the same as %load, for compatibility with IPython.
     """
     if len(args) == 1:
-        if isinstance(args[0], (unicode,str)):
-            args = tuple(args[0].replace(',',' ').split())
+        if isinstance(args[0], (unicode, str)):
+            args = (args[0].strip(), )
         if isinstance(args[0], (list, tuple)):
             args = args[0]
 
@@ -3441,14 +3664,11 @@ def sage_chat(chatroom=None, height="258px"):
 
 
 ########################################################
-# Documentation of magics
+# Documentation of modes
 ########################################################
-def magics(dummy=None):
+def modes():
     """
-    Type %magics to print all SageMathCloud magic commands or
-    magics() to get a list of them.
-
-    To use a magic command, either type
+    To use a mode command, either type
 
         %command <a line of code>
 
@@ -3457,30 +3677,26 @@ def magics(dummy=None):
         %command
         [rest of cell]
 
-    Create your own magic command by defining a function that takes
+    Create your own mode command by defining a function that takes
     a string as input and outputs a string. (Yes, it is that simple.)
     """
     import re
-    magic_cmds = set()
+    mode_cmds = set()
     for s in open(os.path.realpath(__file__), 'r').xreadlines():
         s = s.strip()
         if s.startswith('%'):
-            magic_cmds.add(re.findall(r'%[a-zA-Z]+', s)[0])
-    magic_cmds.discard('%s')
+            mode_cmds.add(re.findall(r'%[a-zA-Z]+', s)[0])
+    mode_cmds.discard('%s')
     for k,v in sage.interfaces.all.__dict__.iteritems():
         if isinstance(v, sage.interfaces.expect.Expect):
-            magic_cmds.add('%'+k)
-    magic_cmds.update(['%cython', '%time', '%magics', '%auto', '%hide', '%hideall',
+            mode_cmds.add('%'+k)
+    mode_cmds.update(['%cython', '%time', '%auto', '%hide', '%hideall',
                        '%fork', '%runfile', '%default_mode', '%typeset_mode'])
-    v = list(sorted(magic_cmds))
-    if dummy is None:
-        return v
-    else:
-        for s in v:
-            print(s)
+    v = list(sorted(mode_cmds))
+    return v
 
 ########################################################
-# Go magic
+# Go mode
 ########################################################
 def go(s):
     """
@@ -3539,7 +3755,58 @@ def go(s):
         except:
             pass
 
+########################################################
+# Java mode
+########################################################
+def java(s):
+    """
+    Run a Java program.  For example,
 
+        %java
+        public class YourName { public static void main(String[] args) { System.out.println("Hello world"); } }
+
+    You can set the whole worksheet to be in java mode by typing
+
+        %default_mode java
+
+    NOTE:
+
+    - There is no relation between one cell and the next.  Each is a separate
+      self-contained java program, which gets compiled and run, with the only
+      side effects being changes to the filesystem.  The program itself is
+      stored in a file named as the public class that is deleted after it is run.
+    """
+    name = re.search('public class (?P<name>[a-zA-Z0-9]+)', s)
+    if name:
+        name = name.group('name')
+    else:
+        print 'error public class name not found'
+        return
+    try:
+        open(name +'.java','w').write(s.encode("UTF-8"))
+        (child_stdin, child_stdout, child_stderr) = os.popen3('javac %s.java'%name)
+        err = child_stderr.read()
+        sys.stdout.write(child_stdout.read())
+        sys.stderr.write(err)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if not os.path.exists(name+'.class'): # failed to produce executable
+            return
+        (child_stdin, child_stdout, child_stderr) = os.popen3('java %s'%name)
+        sys.stdout.write(child_stdout.read())
+        sys.stderr.write('\n'+child_stderr.read())
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        pass
+        try:
+            os.unlink(name+'.java')
+        except:
+            pass
+        try:
+            os.unlink(name+'.class')
+        except:
+            pass
 
 # Julia pexepect interface support
 import julia
@@ -3571,3 +3838,106 @@ def help(*args, **kwds):
 
 - **License information:** For license information about Sage and its components, enter `license()`."""%sage.version.version
         salvus.md(s)
+
+# Import the jupyter kernel client.
+from sage_jupyter import jupyter
+
+# license() workaround for IPython pager
+# could also set os.environ['TERM'] to 'dumb' to workaround the pager
+def license():
+    r"""
+    Display Sage license file COPYING.txt
+
+    You can also view this information in an SMC terminal session:
+
+        | $ sage
+        | sage: license()
+
+    """
+    print(sage.misc.copying.license)
+
+# search_src
+import os
+import glob
+
+# from http://stackoverflow.com/questions/9877462/is-there-a-python-equivalent-to-the-which-commane
+# in python 3.3+ there is shutil.which()
+def which(pgm):
+    path=os.getenv('PATH')
+    for p in path.split(os.path.pathsep):
+        p=os.path.join(p,pgm)
+        if os.path.exists(p) and os.access(p,os.X_OK):
+            return p
+
+from sage_server import MAX_CODE_SIZE
+def search_src(str, max_chars = MAX_CODE_SIZE):
+    r"""
+    Get file names resulting from git grep of smc repo
+
+    INPUT:
+
+    - ``str`` -- string, expression to search for; will be quoted
+    - ``max_chars`` -- integer, max characters to display from selected file
+
+    OUTPUT:
+
+    Interact selector of matching filenames. Choosing one causes its
+    contents to be shown in salvus.code() output.
+    """
+    sage_cmd = which("sage")
+    if os.path.islink(sage_cmd):
+        sage_cmd = os.readlink(sage_cmd)
+
+    # /projects/sage/sage-x.y/src/bin
+    sdir = os.path.dirname(sage_cmd)
+
+    # /projects/sage/sage-x.y
+    sdir = os.path.dirname(os.path.dirname(sdir))
+
+    # /projects/sage/sage-x.y/src
+    sdir = glob.glob(sdir + "/src/sage")[0]
+
+    cmd = 'cd %s;timeout 5 git grep -il "%s"'%(sdir, str)
+    srch = os.popen(cmd).read().splitlines()
+    header = "files matched"
+    nftext = header + ": %s"%len(srch)
+
+    @interact
+    def _(fname = selector([nftext]+srch,"view source file:")):
+        if not fname.startswith(header):
+            with open(os.path.join(sdir, fname), 'r') as infile:
+                code = infile.read(max_chars)
+            salvus.code(code, mode = "python", filename = fname)
+
+# search_doc
+def search_doc(str):
+    r"""
+    Create link to Google search of sage docs.
+
+    INPUT:
+
+    - ``str`` -- string, expression to search for; will be quoted
+
+    OUTPUT:
+
+    HTML hyperlink to google search
+    """
+    txt = 'Use this link to search: ' + \
+    '<a href="https://www.google.com/search?q=site%3Adoc.sagemath.org+' + \
+    str + '&oq=site%3Adoc.sagemath.org">'+str+'</a>'
+    salvus.html(txt)
+
+import sage.misc.session
+def show_identifiers():
+    """
+    Returns a list of all variable names that have been defined during this session.
+
+    SMC introduces worksheet variables, including 'smc','salvus', 'require', and after reset(), 'sage_salvus'.
+    These identifiers are removed from the output of sage.misc.session.show_identifiers() on return.
+    User should not assign to these variables when running code in a worksheet.
+    """
+    si =  eval('show_identifiers.fn()',salvus.namespace)
+    si2 = [v for v in si if v not in ['smc','salvus','require','sage_salvus']]
+    return si2
+
+show_identifiers.fn = sage.misc.session.show_identifiers

@@ -1,8 +1,8 @@
-###############################################################################
+##############################################################################
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2015, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -19,17 +19,26 @@
 #
 ###############################################################################
 
+$             = window.$
 async         = require('async')
 misc          = require('smc-util/misc')
 _             = require('underscore')
 
-{redux, rclass, React, ReactDOM, rtypes, Redux, Actions, Store}  = require('./smc-react')
+{redux, rclass, React, ReactDOM, rtypes, Actions, Store}  = require('./smc-react')
 
-{Button, ButtonToolbar, Input, Row, Col, Accordion, Panel, Well, Alert, ButtonGroup} = require('react-bootstrap')
+{Button, ButtonToolbar, FormControl, FormGroup, Row, Col, Accordion, Panel, Well, Alert, ButtonGroup, InputGroup} = require('react-bootstrap')
 {ActivityDisplay, ErrorDisplay, Icon, Loading, SelectorInput, r_join, Space, TimeAgo, Tip, Footer} = require('./r_misc')
 {HelpEmailLink, SiteName, PolicyPricingPageUrl, PolicyPrivacyPageUrl, PolicyCopyrightPageUrl} = require('./customize')
 
 {PROJECT_UPGRADES} = require('smc-util/schema')
+
+load_stripe = (cb) ->
+    if Stripe?
+        cb()
+    else
+        $.getScript("https://js.stripe.com/v2/").done(->cb()).fail(->cb('Unable to load Stripe support'))
+
+last_subscription_attempt = null
 
 actions = store = undefined
 # Create the billing actions
@@ -38,10 +47,9 @@ class BillingActions extends Actions
         @setState(error:'')
 
     update_customer: (cb) =>
-        if not Stripe?
-            cb?("stripe not available")
+        if @_update_customer_lock
             return
-        if @_update_customer_lock then return else @_update_customer_lock=true
+        @_update_customer_lock=true
         @setState(action:"Updating billing information")
         customer_is_defined = false
         {salvus_client} = require('./salvus_client')   # do not put at top level, since some code runs on server
@@ -52,9 +60,12 @@ class BillingActions extends Actions
                         @_update_customer_lock = false
                         if not err and not resp?.stripe_publishable_key?
                             err = "WARNING: Stripe is not configured -- billing not available"
+                            @setState(no_stripe:true)
                         if not err
-                            Stripe.setPublishableKey(resp.stripe_publishable_key)
-                            @setState(customer: resp.customer, loaded:true)
+                            @setState
+                                customer               : resp.customer
+                                loaded                 : true
+                                stripe_publishable_key : resp.stripe_publishable_key
                             customer_is_defined = resp.customer?
                         cb(err)
             (cb) =>
@@ -63,7 +74,7 @@ class BillingActions extends Actions
                 else
                     # only call get_invoices if the customer already exists in the system!
                     salvus_client.stripe_get_invoices
-                        limit : 100  # TODO -- this will change when we use webhooks and our own database of info.
+                        limit : 100  # FUTURE: -- this will change when we use webhooks and our own database of info.
                         cb: (err, invoices) =>
                             if not err
                                 @setState(invoices: invoices)
@@ -99,8 +110,16 @@ class BillingActions extends Actions
     submit_payment_method: (info, cb) =>
         response = undefined
         async.series([
+            (cb) =>
+                if not store.get("stripe_publishable_key")?
+                    @update_customer(cb)  # this defines stripe_publishable_key, or fails
+                else
+                    cb()
+            (cb) =>
+                load_stripe(cb)
             (cb) =>  # see https://stripe.com/docs/stripe.js#createToken
                 @setState(action:"Creating a new payment method -- get token from Stripe")
+                Stripe.setPublishableKey(store.get("stripe_publishable_key"))
                 Stripe.card.createToken info, (status, _response) =>
                     if status != 200
                         cb(_response.error.message)
@@ -114,11 +133,40 @@ class BillingActions extends Actions
             cb?(err)
         )
 
-    cancel_subscription: (id) =>
-        @_action('cancel_subscription', 'Cancel a subscription', subscription_id : id)
+    cancel_subscription: (id, cb) =>
+        @_action('cancel_subscription', 'Cancel a subscription', {subscription_id : id, cb : cb})
 
-    create_subscription : (plan='standard') =>
-        @_action('create_subscription', 'Create a subscription', plan : plan)
+    create_subscription: (plan='standard') =>
+        {salvus_client} = require('./salvus_client')   # do not put at top level, since some code runs on server
+        lsa = last_subscription_attempt
+        if lsa? and lsa > misc.server_minutes_ago(1)
+            @setState(action:'', error: 'Too many subscription attempts in the last minute. Please check if you are already subscribed!')
+        else
+            @setState(error: '')
+            @_action('create_subscription', 'Create a subscription', plan : plan)
+            last_subscription_attempt = misc.server_time()
+
+    # Cancel all subscriptions, remove credit cards, etc. -- this is not a normal action, and is used
+    # only when deleting an account.  We allow it a callback.
+    cancel_everything: (cb) =>
+        async.series([
+            (cb) =>
+                # update info about this customer
+                @update_customer(cb)
+            (cb) =>
+                # delete stuff
+                async.parallel([
+                    (cb) =>
+                        # delete payment methods
+                        ids = (x.id for x in redux.getStore('billing').getIn(['customer', 'sources', 'data'])?.toJS() ? [])
+                        async.map(ids, @delete_payment_method, cb)
+                    (cb) =>
+                        # cancel subscriptions
+                        ids = (x.id for x in redux.getStore('billing').getIn(['customer', 'subscriptions', 'data'])?.toJS() ? []   when not x.canceled_at)
+                        async.map(ids, @cancel_subscription, cb)
+                ], cb)
+        ], cb)
+
 
 actions = redux.createActions('billing', BillingActions)
 store   = redux.createStore('billing')
@@ -140,20 +188,24 @@ AddPaymentMethod = rclass
         redux    : rtypes.object.isRequired
         on_close : rtypes.func.isRequired  # called when this should be closed
 
-    getInitialState : ->
-        new_payment_info : {name : @props.redux.getStore('account').get_fullname()}
-        submitting       : false
-        error            : ''
-        cvc_help         : false
+    getInitialState: ->
+        new_payment_info :
+            name            : @props.redux.getStore('account').get_fullname()
+            number          : ""
+            address_state   : ""
+            address_country : ""
+        submitting : false
+        error      : ''
+        cvc_help   : false
 
-    submit_payment_method : ->
+    submit_payment_method: ->
         @setState(error: false, submitting:true)
         @props.redux.getActions('billing').submit_payment_method @state.new_payment_info, (err) =>
             @setState(error: err, submitting:false)
             if not err
                 @props.on_close()
 
-    render_payment_method_field : (field, control) ->
+    render_payment_method_field: (field, control) ->
         if field == 'State' and @state.new_payment_info.address_country != "United States"
             return
         <Row key={field}>
@@ -165,39 +217,47 @@ AddPaymentMethod = rclass
             </Col>
         </Row>
 
-    set_input_info : (field, ref, value) ->
+    set_input_info: (field, ref, value) ->
         x = misc.copy(@state.new_payment_info)
-        x[field] = value ? @refs[ref].getValue()
+        x[field] = value ? ReactDOM.findDOMNode(@refs[ref]).value
         @setState(new_payment_info: x)
 
-    render_input_card_number : ->
+    render_input_card_number: ->
         icon = brand_to_icon($.payment.cardType(@state.new_payment_info.number))
         value = if @valid('number') then $.payment.formatCardNumber(@state.new_payment_info.number) else @state.new_payment_info.number
-        <Input
-            autoFocus
-            ref         = 'input_card_number'
-            style       = @style('number')
-            type        = 'text'
-            size        = '20'
-            placeholder = '1234 5678 9012 3456'
-            value       = {value}
-            onChange    = {=>@set_input_info('number','input_card_number')}
-            addonAfter  = {<Icon name={icon} />}
-            disabled    = {@state.submitting}
-        />
+        <FormGroup>
+            <InputGroup>
+                <FormControl
+                    autoFocus
+                    ref         = 'input_card_number'
+                    style       = @style('number')
+                    type        = 'text'
+                    size        = '20'
+                    placeholder = '1234 5678 9012 3456'
+                    value       = {value}
+                    onChange    = {=>@set_input_info('number','input_card_number')}
+                    disabled    = {@state.submitting}
+                />
+                <InputGroup.Addon>
+                    <Icon name={icon} />
+                </InputGroup.Addon>
+            </InputGroup>
+        </FormGroup>
 
-    render_input_cvc_input : ->
-        <Input
-            ref         = 'input_cvc'
-            style       = {misc.merge({width:'5em'}, @style('cvc'))}
-            type        = 'text'
-            size        = 4
-            placeholder = '···'
-            onChange    = {=>@set_input_info('cvc', 'input_cvc')}
-            disabled    = {@state.submitting}
-        />
+    render_input_cvc_input: ->
+        <FormGroup>
+            <FormControl
+                ref         = 'input_cvc'
+                style       = {misc.merge({width:'5em'}, @style('cvc'))}
+                type        = 'text'
+                size        = 4
+                placeholder = '···'
+                onChange    = {=>@set_input_info('cvc', 'input_cvc')}
+                disabled    = {@state.submitting}
+            />
+        </FormGroup>
 
-    render_input_cvc_help : ->
+    render_input_cvc_help: ->
         if @state.cvc_help
             <div>The <a href='https://en.wikipedia.org/wiki/Card_security_code' target='_blank'>security code</a> is
             located on the back of credit or debit cards and is a separate group of 3 (or 4) digits to the right of
@@ -205,13 +265,13 @@ AddPaymentMethod = rclass
         else
             <a href='' onClick={(e)=>e.preventDefault();@setState(cvc_help:true)}>(what is the security code?)</a>
 
-    render_input_cvc : ->
+    render_input_cvc: ->
         <Row>
             <Col md=3>{@render_input_cvc_input()}</Col>
             <Col md=9>{@render_input_cvc_help()}</Col>
         </Row>
 
-    valid : (name) ->
+    valid: (name) ->
         info = @state.new_payment_info
 
         if not name?
@@ -225,7 +285,7 @@ AddPaymentMethod = rclass
             return true
 
         x = info[name]
-        if not x?
+        if not x
             return
         switch name
             when 'number'
@@ -251,7 +311,7 @@ AddPaymentMethod = rclass
             when 'address_zip'
                 return misc.is_valid_zipcode(x)
 
-    style : (name) ->
+    style: (name) ->
         a = @valid(name)
         if not a?
             return {}
@@ -260,60 +320,68 @@ AddPaymentMethod = rclass
         else
             return validate.invalid
 
-    render_input_expiration : ->
-        <div style={marginBottom:'15px'}>
-            <input
-                readOnly    = {@state.submitting}
-                className   = 'form-control'
-                style       = {misc.merge({display:'inline', width:'5em'}, @style('exp_month'))}
-                placeholder = 'MM'
-                type        = 'text'
-                size        = '2'
-                onChange    = {(e)=>@set_input_info('exp_month', undefined, e.target.value)}
-            />
-            <span> / </span>
-            <input
-                readOnly    = {@state.submitting}
-                className   = 'form-control'
-                style       = {misc.merge({display:'inline', width:'5em'}, @style('exp_year'))}
-                placeholder = 'YY'
-                type        = 'text'
-                size        = '2'
-                onChange    = {(e)=>@set_input_info('exp_year', undefined, e.target.value)}
-            />
+    render_input_expiration: ->
+        <div style={marginBottom:'15px', display:'flex'}>
+            <FormGroup>
+                <FormControl
+                    readOnly    = {@state.submitting}
+                    className   = 'form-control'
+                    style       = {misc.merge({width:'5em'}, @style('exp_month'))}
+                    placeholder = 'MM'
+                    type        = 'text'
+                    size        = '2'
+                    onChange    = {(e)=>@set_input_info('exp_month', undefined, e.target.value)}
+                />
+            </FormGroup>
+            <span style={fontSize:'22px', margin: '1px 5px'}> / </span>
+            <FormGroup>
+                <FormControl
+                    readOnly    = {@state.submitting}
+                    className   = 'form-control'
+                    style       = {misc.merge({width:'5em'}, @style('exp_year'))}
+                    placeholder = 'YY'
+                    type        = 'text'
+                    size        = '2'
+                    onChange    = {(e)=>@set_input_info('exp_year', undefined, e.target.value)}
+                />
+            </FormGroup>
         </div>
 
-    render_input_name : ->
-        <Input
-            ref         = 'input_name'
-            type        = 'text'
-            placeholder = 'Name on Card'
-            onChange    = {=>@set_input_info('name', 'input_name')}
-            style       = {@style('name')}
-            value       = {@state.new_payment_info.name}
-            disabled    = {@state.submitting}
-        />
+    render_input_name: ->
+        <FormGroup>
+            <FormControl
+                ref         = 'input_name'
+                type        = 'text'
+                placeholder = 'Name on Card'
+                onChange    = {=>@set_input_info('name', 'input_name')}
+                style       = {@style('name')}
+                value       = {@state.new_payment_info.name}
+                disabled    = {@state.submitting}
+            />
+        </FormGroup>
 
-    render_input_country : ->
+    render_input_country: ->
         <SelectorInput
             options   = {COUNTRIES}
             on_change = {(country)=>@set_input_info('address_country', '', country)}
             disabled  = {@state.submitting}
         />
 
-    render_input_zip : ->
-        <Input
-            ref         = 'input_address_zip'
-            style       = {@style('address_zip')}
-            placeholder = 'Zip Code'
-            type        = 'text'
-            size        = '5'
-            pattern     = '\d{5,5}(-\d{4,4})?'
-            onChange    = {=>@set_input_info('address_zip', 'input_address_zip')}
-            disabled    = {@state.submitting}
-        />
+    render_input_zip: ->
+        <FormGroup>
+            <FormControl
+                ref         = 'input_address_zip'
+                style       = {@style('address_zip')}
+                placeholder = 'Zip Code'
+                type        = 'text'
+                size        = '5'
+                pattern     = '\d{5,5}(-\d{4,4})?'
+                onChange    = {=>@set_input_info('address_zip', 'input_address_zip')}
+                disabled    = {@state.submitting}
+            />
+        </FormGroup>
 
-    render_tax_notice : ->
+    render_tax_notice: ->
         <Row>
             <Col sm=12>
                 <Alert bsStyle='info'>
@@ -323,7 +391,7 @@ AddPaymentMethod = rclass
             </Col>
         </Row>
 
-    render_input_state_zip : ->
+    render_input_state_zip: ->
         <div>
             <Row>
                 <Col sm=7>
@@ -341,7 +409,7 @@ AddPaymentMethod = rclass
         </div>
 
 
-    render_payment_method_fields : ->
+    render_payment_method_fields: ->
         PAYMENT_METHOD_FORM =
             'Card Number'         : @render_input_card_number
             'Security Code (CVC)' : @render_input_cvc
@@ -353,7 +421,7 @@ AddPaymentMethod = rclass
         for field, control of PAYMENT_METHOD_FORM
             @render_payment_method_field(field, control())
 
-    render_payment_method_buttons : ->
+    render_payment_method_buttons: ->
         <div>
             <Row>
                 <Col sm=4>
@@ -377,11 +445,11 @@ AddPaymentMethod = rclass
             </div>
         </div>
 
-    render_error : ->
+    render_error: ->
         if @state.error
             <ErrorDisplay error={@state.error} onClose={=>@setState(error:'')} />
 
-    render : ->
+    render: ->
         <Row>
             <Col sm=6 smOffset=3>
                 <Well style={boxShadow:'5px 5px 5px lightgray', zIndex:2}>
@@ -401,48 +469,55 @@ PaymentMethod = rclass
 
     propTypes :
         source         : rtypes.object.isRequired
-        default        : rtypes.bool.isRequired
-        set_as_default : rtypes.func.isRequired   # called when this card should be set to default
-        delete_method  : rtypes.func.isRequired   # called when this card should be deleted
+        default        : rtypes.bool  # required for set_as_default
+        set_as_default : rtypes.func  # called when this card should be set to default
+        delete_method  : rtypes.func  # called when this card should be deleted
 
-    getInitialState : ->
+    getInitialState: ->
         confirm_default : false
         confirm_delete  : false
 
-    icon_name : ->
+    icon_name: ->
         return brand_to_icon(@props.source.brand.toLowerCase())
 
-    render_confirm_default : ->
-        <Row>
-            <Col md=5 mdOffset=2>
-                Are you sure you want to set this payment method to be the default for invoices?
-            </Col>
-            <Col md=5>
-                <ButtonToolbar>
-                    <Button onClick={=>@setState(confirm_default:false)}>Cancel</Button>
-                    <Button onClick={=>@setState(confirm_default:false);@props.set_as_default()} bsStyle='warning'>
-                        <Icon name='trash'/> Set to Default
-                    </Button>
-                </ButtonToolbar>
-            </Col>
-        </Row>
+    render_confirm_default: ->
+        <Alert bsStyle='warning'>
+            <Row>
+                <Col md=5 mdOffset=2>
+                    <p>Are you sure you want to set this payment card to be the default?</p>
+                    <p>All future payments will be made with the card that is the default <b>at the time of renewal</b>.
+                    Changing your default card right before a subscription renewal will cause the <Space/>
+                    new default to be charged instead of the previous one.</p>
+                </Col>
+                <Col md=5>
+                    <ButtonToolbar>
+                        <Button onClick={=>@setState(confirm_default:false)}>Cancel</Button>
+                        <Button onClick={=>@setState(confirm_default:false);@props.set_as_default()} bsStyle='warning'>
+                            <Icon name='trash'/> Set to Default
+                        </Button>
+                    </ButtonToolbar>
+                </Col>
+            </Row>
+        </Alert>
 
-    render_confirm_delete : ->
-        <Row>
-            <Col md=5 mdOffset=2>
-                Are you sure you want to delete this payment method?
-            </Col>
-            <Col md=5>
-                <ButtonToolbar>
-                    <Button onClick={=>@setState(confirm_delete:false)}>Cancel</Button>
-                    <Button bsStyle='danger' onClick={=>@setState(confirm_delete:false);@props.delete_method()}>
-                        <Icon name='trash'/> Delete Payment Method
-                    </Button>
-                </ButtonToolbar>
-            </Col>
-        </Row>
+    render_confirm_delete: ->
+        <Alert bsStyle='danger'>
+            <Row>
+                <Col md=5 mdOffset=2>
+                    Are you sure you want to delete this payment method?
+                </Col>
+                <Col md=5>
+                    <ButtonToolbar>
+                        <Button onClick={=>@setState(confirm_delete:false)}>Cancel</Button>
+                        <Button bsStyle='danger' onClick={=>@setState(confirm_delete:false);@props.delete_method()}>
+                            <Icon name='trash'/> Delete Payment Method
+                        </Button>
+                    </ButtonToolbar>
+                </Col>
+            </Row>
+        </Alert>
 
-    render_card : ->
+    render_card: ->
         <Row>
             <Col md=2>
                 <Icon name={@icon_name()} /> {@props.source.brand}
@@ -464,23 +539,27 @@ PaymentMethod = rclass
                 <Space/><Space/>
                 {@props.source.address_zip}
             </Col>
-            <Col md=3>
-                <ButtonToolbar style={float: "right"}>
-                    <Button
-                        onClick  = {=>@setState(confirm_default:true)}
-                        disabled = {@props.default}
-                        bsStyle  = {if @props.default then 'primary' else 'default'}
-                    >
-                        Default
-                    </Button>
-                    <Button onClick={=>@setState(confirm_delete:true)}>
-                        <Icon name="trash" /> Delete
-                    </Button>
-                </ButtonToolbar>
-            </Col>
+            {@render_action_buttons() if @props.set_as_default? or @props.delete_method?}
         </Row>
 
-    render : ->
+    render_action_buttons: ->
+        <Col md=3>
+            <ButtonToolbar style={float: "right"}>
+                {<Button
+                    onClick  = {=>@setState(confirm_default:true)}
+                    disabled = {@props.default}
+                    bsStyle  = {if @props.default then 'primary' else 'default'}
+                >
+                    Default{<span>... </span> if not @props.default}
+                </Button> if @props.set_as_default? }
+
+                {<Button onClick={=>@setState(confirm_delete:true)}>
+                    <Icon name="trash" /> Delete
+                </Button> if @props.delete_method? }
+            </ButtonToolbar>
+        </Col>
+
+    render: ->
         <div style={borderBottom:'1px solid #999',  paddingTop: '5px', paddingBottom: '5px'}>
             {@render_card()}
             {@render_confirm_default() if @state.confirm_default}
@@ -495,23 +574,23 @@ PaymentMethods = rclass
         sources : rtypes.object.isRequired
         default : rtypes.string
 
-    getInitialState : ->
+    getInitialState: ->
         state : 'view'   #  'delete' <--> 'view' <--> 'add_new'
         error : ''
 
-    add_payment_method : ->
+    add_payment_method: ->
         @setState(state:'add_new')
 
-    render_add_payment_method : ->
+    render_add_payment_method: ->
         if @state.state == 'add_new'
             <AddPaymentMethod redux={@props.redux} on_close={=>@setState(state:'view')} />
 
-    render_add_payment_method_button : ->
+    render_add_payment_method_button: ->
         <Button disabled={@state.state != 'view'} onClick={@add_payment_method} bsStyle='primary' className='pull-right'>
             <Icon name='plus-circle' /> Add Payment Method...
         </Button>
 
-    render_header : ->
+    render_header: ->
         <Row>
             <Col sm=6>
                 <Icon name='credit-card' /> Payment Methods
@@ -521,30 +600,30 @@ PaymentMethods = rclass
             </Col>
         </Row>
 
-    set_as_default : (id) ->
+    set_as_default: (id) ->
         @props.redux.getActions('billing').set_as_default_payment_method(id)
 
-    delete_method : (id) ->
+    delete_method: (id) ->
         @props.redux.getActions('billing').delete_payment_method(id)
 
-    render_payment_method : (source) ->
+    render_payment_method: (source) ->
         <PaymentMethod
             key            = {source.id}
             source         = {source}
             default        = {source.id==@props.default}
-            set_as_default = {=>@set_as_default(source.id)}   # closure -- must be in separate function from below
+            set_as_default = {=>@set_as_default(source.id)}
             delete_method  = {=>@delete_method(source.id)}
         />
 
-    render_payment_methods : ->
+    render_payment_methods: ->
         for source in @props.sources.data
             @render_payment_method(source)
 
-    render_error : ->
+    render_error: ->
         if @state.error
             <ErrorDisplay error={@state.error} onClose={=>@setState(error:'')} />
 
-    render : ->
+    render: ->
         <Panel header={@render_header()}>
             {@render_error()}
             {@render_add_payment_method() if @state.state in ['add_new']}
@@ -572,7 +651,7 @@ exports.ProjectQuotaBoundsTable = ProjectQuotaBoundsTable = rclass
             </Tip>
         </div>
 
-    render : ->
+    render: ->
         max = PROJECT_UPGRADES.max_per_project
         <Panel
             header = 'Maximum possible quotas per project'
@@ -582,7 +661,7 @@ exports.ProjectQuotaBoundsTable = ProjectQuotaBoundsTable = rclass
 
 exports.ProjectQuotaFreeTable = ProjectQuotaFreeTable = rclass
     render_project_quota: (name, value) ->
-        # TODO is this a code dup from above?
+        # SMELL: is this a code dup from above?
         data = PROJECT_UPGRADES.params[name]
         amount = value * data.pricing_factor
         unit = data.pricing_unit
@@ -600,7 +679,7 @@ exports.ProjectQuotaFreeTable = ProjectQuotaFreeTable = rclass
             </Tip>
         </div>
 
-    render : ->
+    render: ->
         free = require('smc-util/schema').DEFAULT_QUOTAS
         <Panel
             header = 'Projects start with these quotas for free'
@@ -612,9 +691,9 @@ exports.ProjectQuotaFreeTable = ProjectQuotaFreeTable = rclass
                 </Tip>
             </div>
             <div style={marginBottom:'5px', marginLeft:'10px'}>
-                <Tip title="Internet access" tip="Despite working inside a web-browser, free projects are not allowed to directly access the internet due to security/abuse reasons.">
+                <Tip title="Network access" tip="Despite working inside a web-browser, free projects are not allowed to directly access the internet due to security/abuse reasons.">
                     <span style={fontWeight:'bold',color:'#666'}>no</span><Space/>
-                    <span style={color:'#999'}>Internet access</span>
+                    <span style={color:'#999'}>Network access</span>
                 </Tip>
             </div>
             {@render_project_quota(name, free[name]) for name in PROJECT_UPGRADES.field_order when free[name]}
@@ -629,10 +708,10 @@ PlanInfo = rclass
         selected : rtypes.bool
         on_click : rtypes.func
 
-    getDefaultProps : ->
+    getDefaultProps: ->
         selected : false
 
-    render_plan_info_line : (name, value, data) ->
+    render_plan_info_line: (name, value, data) ->
         <div key={name} style={marginBottom:'5px', marginLeft:'10px'}>
             <Tip title={data.display} tip={data.desc}>
                 <span style={fontWeight:'bold',color:'#666'}>
@@ -653,8 +732,7 @@ PlanInfo = rclass
             <span style={fontSize:'14px'}> / {period}</span>
         </span>
 
-    render_price : (prices, periods) ->
-        #sep = <span style={fontSize:"small", margin:"15px"}>or</span>
+    render_price: (prices, periods) ->
         if @props.on_click?
             # note: in non-static, there is always just *one* price (several only on "static" pages)
             for i in [0...prices.length]
@@ -662,16 +740,16 @@ PlanInfo = rclass
                     {@render_cost(prices[i], periods[i])}
                 </Button>
         else
-            <h3 style={textAlign:'center'}>
+            <h3 style={textAlign:'left'}>
                 {r_join((@render_cost(prices[i], periods[i]) for i in [0...prices.length]), <br/>)}
             </h3>
 
-    render_plan_name : (plan_data) ->
+    render_plan_name: (plan_data) ->
         <div style={paddingLeft:"10px"}>
             <Icon name={plan_data.icon} /> <span style={fontWeight:'bold'}>{misc.capitalize(@props.plan).replace(/_/g,' ')} plan</span>
         </div>
 
-    render : ->
+    render: ->
         plan_data = PROJECT_UPGRADES.membership[@props.plan]
         if not plan_data?
             return <div>Unknown plan type: {@props.plan}</div>
@@ -709,24 +787,27 @@ AddSubscription = rclass
         selected_plan : rtypes.string
         actions       : rtypes.object.isRequired
 
-    getDefaultProps : ->
+    getDefaultProps: ->
         selected_plan : ''
 
-    getInitialState : ->
+    getInitialState: ->
         selected_button : 'month'
 
-    submit_create_subscription : ->
+    is_recurring: ->
+        not PROJECT_UPGRADES.membership[@props.selected_plan.split('-')[0]].cancel_at_period_end
+
+    submit_create_subscription: ->
         plan = @props.selected_plan
         @props.actions.create_subscription(plan)
 
-    set_button_and_deselect_plans : (button) ->
+    set_button_and_deselect_plans: (button) ->
         if @state.selected_button isnt button
             set_selected_plan('')
             @setState(selected_button : button)
 
-    render_period_selection_buttons : ->
+    render_period_selection_buttons: ->
         <div>
-            <ButtonGroup bsSize='large' style={marginBottom:'20px'}>
+            <ButtonGroup bsSize='large' style={marginBottom:'20px', display:'flex'}>
                 <Button
                     bsStyle = {if @state.selected_button is 'month' then 'primary'}
                     onClick = {=>@set_button_and_deselect_plans('month')}
@@ -743,13 +824,18 @@ AddSubscription = rclass
                     bsStyle = {if @state.selected_button is 'month4' then 'primary'}
                     onClick = {=>@set_button_and_deselect_plans('month4')}
                 >
-                    Course package (4-months)
+                    4-Month course packages
+                </Button>
+                <Button
+                    bsStyle = {if @state.selected_button is 'year1' then 'primary'}
+                    onClick = {=>@set_button_and_deselect_plans('year1')}
+                >
+                    Yearly course packages
                 </Button>
             </ButtonGroup>
         </div>
 
     render_renewal_info: ->
-        console.log("render_renewal_info", @props.selected_plan)
         if @props.selected_plan
             renews = not PROJECT_UPGRADES.membership[@props.selected_plan.split('-')[0]].cancel_at_period_end
             length = PROJECT_UPGRADES.period_names[@state.selected_button]
@@ -758,15 +844,15 @@ AddSubscription = rclass
                 {<span>You will be <b>charged only once</b> for the course package, which lasts {length}.  It does <b>not automatically renew</b>.</span> if not renews}
             </p>
 
-    render_subscription_grid : ->
+    render_subscription_grid: ->
         <SubscriptionGrid period={@state.selected_button} selected_plan={@props.selected_plan} />
 
-    render_dedicated_resources : ->
+    render_dedicated_resources: ->
         <div style={marginBottom:'15px'}>
             <ExplainResources type='dedicated'/>
         </div>
 
-    render_create_subscription_options : ->
+    render_create_subscription_options: ->
         # <h3><Icon name='list-alt'/> Sign up for a Subscription</h3>
         <div>
             <div style={textAlign:'center'}>
@@ -779,17 +865,17 @@ AddSubscription = rclass
             {@render_dedicated_resources() if @state.selected_button is 'dedicated_resources'}
         ###
 
-    render_create_subscription_confirm : ->
-        if not PROJECT_UPGRADES.membership[@props.selected_plan.split('-')[0]].cancel_at_period_end
+    render_create_subscription_confirm: ->
+        if @is_recurring()
             subscription = " and you will be signed up for a recurring subscription"
-        <Alert bsStyle='primary' >
+        <Alert>
             <h4><Icon name='check' /> Confirm your selection </h4>
             <p>You have selected the <span style={fontWeight:'bold'}>{misc.capitalize(@props.selected_plan).replace(/_/g,' ')} subscription</span>.</p>
             {@render_renewal_info()}
             <p>By clicking 'Add Subscription' your payment card will be immediately charged{subscription}.</p>
         </Alert>
 
-    render_create_subscription_buttons : ->
+    render_create_subscription_buttons: ->
         <Row>
             <Col sm=4>
                 {powered_by_stripe()}
@@ -809,17 +895,60 @@ AddSubscription = rclass
             </Col>
         </Row>
 
-    render : ->
+    render: ->
         <Row>
             <Col sm=10 smOffset=1>
                 <Well style={boxShadow:'5px 5px 5px lightgray', zIndex:1}>
                     {@render_create_subscription_options()}
                     {@render_create_subscription_confirm() if @props.selected_plan isnt ''}
+                    {<ConfirmPaymentMethod
+                        is_recurring = {@is_recurring()}
+                    /> if @props.selected_plan isnt ''}
                     {@render_create_subscription_buttons()}
                 </Well>
                 <ExplainResources type='shared'/>
             </Col>
         </Row>
+
+ConfirmPaymentMethod = rclass
+    reduxProps :
+        billing :
+            customer : rtypes.object
+
+    propTypes :
+        is_recurring : rtypes.bool
+
+    render_single_payment_confirmation: ->
+        <span>
+            <p>Payment will be processed with the card below.</p>
+            <p>To change payment methods, please change your default card above.</p>
+        </span>
+
+
+    render_recurring_payment_confirmation: ->
+        <span>
+            <p>The initial payment will be processed with the card below.</p>
+            <p>Future payments will be made with your default card<Space/>
+            <b>at the time of renewal</b>.
+            Changing your default card right before renewal will cause the <Space/>
+            new default to be charged instead of the previous one.</p>
+        </span>
+
+    render: ->
+        for card_data in @props.customer.sources.data
+            if card_data.id == @props.customer.default_source
+                default_card = card_data
+
+        <Alert>
+            <h4><Icon name='check' /> Confirm your payment card</h4>
+            {@render_single_payment_confirmation() if not @props.is_recurring}
+            {@render_recurring_payment_confirmation() if @props.is_recurring}
+            <Well>
+                <PaymentMethod
+                    source = {default_card}
+                />
+            </Well>
+        </Alert>
 
 
 exports.SubscriptionGrid = SubscriptionGrid = rclass
@@ -830,36 +959,36 @@ exports.SubscriptionGrid = SubscriptionGrid = rclass
         selected_plan : rtypes.string
         is_static     : rtypes.bool    # used for display mode
 
-    getDefaultProps : ->
+    getDefaultProps: ->
         is_static : false
 
-    is_selected : (plan, period) ->
+    is_selected: (plan, period) ->
         if @props.period is 'year'
             return @props.selected_plan is "#{plan}-year"
         else
             return @props.selected_plan is plan
 
-    render_plan_info : (plan, period) ->
+    render_plan_info: (plan, period) ->
         <PlanInfo
             plan     = {plan}
             period   = {period}
             selected = {@is_selected(plan, period)}
             on_click = {if not @props.is_static then ->set_selected_plan(plan, period)} />
 
-    render_cols : (row, ncols) ->
+    render_cols: (row, ncols) ->
         width = 12/ncols
         for plan in row
             <Col sm={width} key={plan}>
                 {@render_plan_info(plan, @props.period)}
             </Col>
 
-    render_rows : (live_subscriptions, ncols) ->
+    render_rows: (live_subscriptions, ncols) ->
         for i, row of live_subscriptions
             <Row key={i}>
                 {@render_cols(row, ncols)}
             </Row>
 
-    render : ->
+    render: ->
         live_subscriptions = []
         periods = misc.split(@props.period)
         for row in PROJECT_UPGRADES.live_subscriptions
@@ -887,13 +1016,14 @@ exports.ExplainResources = ExplainResources = rclass
         type : rtypes.string.isRequired    # 'shared', 'dedicated'
         is_static : rtypes.bool
 
-    getDefaultProps : ->
+    getDefaultProps: ->
         is_static : false
 
     render_shared: ->
         <div>
             <Row>
                 <Col md=8 sm=12>
+                    <a name="projects"></a>
                     <h4>Projects</h4>
                     <div>
                     Your work on <SiteName/> happens inside <em>projects</em>.
@@ -992,23 +1122,49 @@ exports.ExplainPlan = ExplainPlan = rclass
                 You can distribute these upgrades to your own projects or any projects where you are a collaborator &mdash;
                 everyone participating in such a collective project benefits and can easily change their allocations at any time!
                 You can get higher-quality hosting on members-only machines and enable access to the internet from projects.
-                You can also increas quotas for CPU and RAM, so that you can work on larger problems and
+                You can also increase quotas for CPU and RAM, so that you can work on larger problems and
                 do more computations simultaneously.
             </div>
         </div>
 
     render_course: ->
         <div style={marginBottom:"10px"}>
-            <h3>Course plans</h3>
+            <h3>Course packages</h3>
             <div>
-                We offer course plans for teaching a class in <SiteName/>.
-                Such plans start right after purchase and last for the full indicated period without auto-renewal.
-                Through the interface of <SiteName/>, you start teaching by creating a course.
-                Each time you add a student, a project will be automatically created for that student.
-                After upgrading your student{"'"}s projects, you can create and distribute assignments,
+                <p>
+                We offer course packages to support teaching using <SiteName/>.
+                They start right after purchase and last for the indicated period and do <b>not auto-renew</b>.
+                Following <a href="https://github.com/mikecroucher/SMC_tutorial/blob/master/README.md" target="_blank">this
+                guide</a>, create a course file.
+                Each time you add a student to your course, a project will be automatically created for that student.
+                You can create and distribute assignments,
                 students work on assignments inside their project (where you can see their progress
                 in realtime and answer their questions),
                 and you later collect and grade their assignments, then return them.
+                </p>
+
+                <p>
+                Paying is optional, but will ensure that your students have a better
+                experience, network access, and receive priority support.  The cost
+                is <b>between $4 and $9 per student</b>, depending on class size and whether
+                you or your students pay.  <b>Start right now:</b> <i>you can fully setup your class
+                and add students immediately before you pay us anything!</i>
+
+                </p>
+
+                <h4>Your or your institution pays</h4>
+                You or your institution may pay for one of the course plans.  You then use your plan to upgrade
+                all projects in the course in the settings tab of the course file.
+
+                <h4>Students pay</h4>
+                In the settings tab of your course, you require that all students
+                pay a one-time $9 fee to move their
+                projects to members only hosts and enable full internet access.
+
+                <br/>
+
+                <br/>
+
             </div>
         </div>
 
@@ -1193,22 +1349,22 @@ Subscription = rclass
         redux        : rtypes.object.isRequired
         subscription : rtypes.object.isRequired
 
-    getInitialState : ->
+    getInitialState: ->
         confirm_cancel : false
 
-    cancel_subscription : ->
+    cancel_subscription: ->
         @props.redux.getActions('billing').cancel_subscription(@props.subscription.id)
 
-    quantity : ->
+    quantity: ->
         q = @props.subscription.quantity
         if q > 1
             return "#{q} × "
 
-    render_cancel_at_end : ->
+    render_cancel_at_end: ->
         if @props.subscription.cancel_at_period_end
             <span style={marginLeft:'15px'}>Will cancel at period end.</span>
 
-    render_info : ->
+    render_info: ->
         sub = @props.subscription
         cancellable = not (sub.cancel_at_period_end or @state.cancelling or @state.confirm_cancel)
         <Row style={paddingBottom: '5px', paddingTop:'5px'}>
@@ -1227,23 +1383,25 @@ Subscription = rclass
             </Col>
         </Row>
 
-    render_confirm : ->
+    render_confirm: ->
         if not @state.confirm_cancel
             return
-        <Row style={borderBottom:'1px solid #999', paddingBottom:'15px', paddingTop:'15px'}>
-            <Col md=6>
-                Are you sure you want to cancel this subscription?  If you cancel your subscription, it will run to the end of the subscription period, but will not be renewed when the current (already paid for) period ends; any upgrades provided by this subscription will be disabled.    If you need further clarification or need a refund, please email  <HelpEmailLink/>.
-            </Col>
-            <Col md=6>
-                <Button onClick={=>@setState(confirm_cancel:false)}>Make no change</Button>
-                <div style={float:'right'}>
-                    <Button bsStyle='danger' onClick={=>@setState(confirm_cancel:false);@cancel_subscription()}>CANCEL: do not auto-renew my subscription</Button>
-                </div>
-            </Col>
-        </Row>
+        <Alert bsStyle='warning'>
+            <Row style={borderBottom:'1px solid #999', paddingBottom:'15px', paddingTop:'15px'}>
+                <Col md=6>
+                    Are you sure you want to cancel this subscription?  If you cancel your subscription, it will run to the end of the subscription period, but will not be renewed when the current (already paid for) period ends; any upgrades provided by this subscription will be disabled.    If you need further clarification or need a refund, please email  <HelpEmailLink/>.
+                </Col>
+                <Col md=6>
+                    <Button onClick={=>@setState(confirm_cancel:false)}>Make no change</Button>
+                    <div style={float:'right'}>
+                        <Button bsStyle='danger' onClick={=>@setState(confirm_cancel:false);@cancel_subscription()}>CANCEL: do not auto-renew my subscription</Button>
+                    </div>
+                </Col>
+            </Row>
+        </Alert>
 
 
-    render : ->
+    render: ->
         <div style={borderBottom:'1px solid #999',  paddingTop: '5px', paddingBottom: '5px'}>
             {@render_info()}
             {@render_confirm() if @state.confirm_cancel}
@@ -1258,10 +1416,10 @@ Subscriptions = rclass
         selected_plan : rtypes.string
         redux         : rtypes.object.isRequired
 
-    getInitialState : ->
-        state : 'view'    # view -> add_new ->         # TODO
+    getInitialState: ->
+        state : 'view'    # view -> add_new ->         # FUTURE: ??
 
-    render_add_subscription_button : ->
+    render_add_subscription_button: ->
         <Button
             bsStyle   = 'primary'
             disabled  = {@state.state isnt 'view' or @props.sources.total_count is 0}
@@ -1270,14 +1428,13 @@ Subscriptions = rclass
             <Icon name='plus-circle' /> Add Subscription...
         </Button>
 
-    render_add_subscription : ->
-        # TODO: the #smc-billing-tab is to scroll back near the top of the page; will probably go away.
+    render_add_subscription: ->
         <AddSubscription
-            on_close      = {=>@setState(state : 'view'); set_selected_plan(''); $("#smc-billing-tab").scrollintoview()}
+            on_close      = {=>@setState(state : 'view'); set_selected_plan('')}
             selected_plan = {@props.selected_plan}
             actions       = {@props.redux.getActions('billing')} />
 
-    render_header : ->
+    render_header: ->
         <Row>
             <Col sm=6>
                 <Icon name='list-alt' /> Subscriptions
@@ -1287,11 +1444,11 @@ Subscriptions = rclass
             </Col>
         </Row>
 
-    render_subscriptions : ->
+    render_subscriptions: ->
         for sub in @props.subscriptions.data
             <Subscription key={sub.id} subscription={sub} redux={@props.redux} />
 
-    render : ->
+    render: ->
         <Panel header={@render_header()}>
             {@render_add_subscription() if @state.state is 'add_new'}
             {@render_subscriptions()}
@@ -1304,27 +1461,27 @@ Invoice = rclass
         invoice : rtypes.object.isRequired
         redux   : rtypes.object.isRequired
 
-    getInitialState : ->
+    getInitialState: ->
         hide_line_items : true
 
-    download_invoice : (e) ->
+    download_invoice: (e) ->
         e.preventDefault()
         invoice = @props.invoice
         username = @props.redux.getStore('account').get_username()
         misc_page = require('./misc_page')  # do NOT require at top level, since code in billing.cjsx may be used on backend
         misc_page.download_file("#{window.smc_base_url}/invoice/sagemathcloud-#{username}-receipt-#{new Date(invoice.date*1000).toISOString().slice(0,10)}-#{invoice.id}.pdf")
 
-    render_paid_status : ->
+    render_paid_status: ->
         if @props.invoice.paid
             return <span>PAID</span>
         else
             return <span style={color:'red'}>UNPAID</span>
 
-    render_description : ->
+    render_description: ->
         if @props.invoice.description
             return <span>{@props.invoice.description}</span>
 
-    render_line_description : (line) ->
+    render_line_description: (line) ->
         v = []
         if line.quantity > 1
             v.push("#{line.quantity} × ")
@@ -1335,7 +1492,7 @@ Invoice = rclass
             v.push(" (start: #{misc.stripe_date(line.period.start)})")
         return v
 
-    render_line_item : (line, n) ->
+    render_line_item: (line, n) ->
         <Row key={line.id} style={borderBottom:'1px solid #aaa'}>
             <Col sm=1>
                 {n}.
@@ -1348,7 +1505,7 @@ Invoice = rclass
             </Col>
         </Row>
 
-    render_tax : ->
+    render_tax: ->
         <Row key='tax' style={borderBottom:'1px solid #aaa'}>
             <Col sm=1>
             </Col>
@@ -1360,7 +1517,7 @@ Invoice = rclass
             </Col>
         </Row>
 
-    render_line_items : ->
+    render_line_items: ->
         if @props.invoice.lines
             if @state.hide_line_items
                 <a href='' onClick={(e)=>e.preventDefault();@setState(hide_line_items:false)}>(details)</a>
@@ -1375,7 +1532,7 @@ Invoice = rclass
                     v.push @render_tax()
                 return v
 
-    render : ->
+    render: ->
         <Row style={borderBottom:'1px solid #999'}>
             <Col md=1>
                 {render_amount(@props.invoice.amount_due, @props.invoice.currency)}
@@ -1402,31 +1559,31 @@ InvoiceHistory = rclass
         redux    : rtypes.object.isRequired
         invoices : rtypes.object
 
-    render_header : ->
+    render_header: ->
         <span>
             <Icon name="list-alt" /> Invoices and Receipts
         </span>
 
-    render_invoices : ->
+    render_invoices: ->
         if not @props.invoices?
             return
         for invoice in @props.invoices.data
             <Invoice key={invoice.id} invoice={invoice} redux={@props.redux} />
 
-    render : ->
+    render: ->
         <Panel header={@render_header()}>
             {@render_invoices()}
         </Panel>
 
-PayCourseFee = rclass
+exports.PayCourseFee = PayCourseFee = rclass
     propTypes :
         project_id : rtypes.string.isRequired
         redux      : rtypes.object.isRequired
 
-    getInitialState : ->
+    getInitialState: ->
         confirm : false
 
-    key : ->
+    key: ->
         return "course-pay-#{@props.project_id}"
 
     buy_subscription: ->
@@ -1481,7 +1638,7 @@ PayCourseFee = rclass
                 </ButtonToolbar>
             </Well>
 
-    render : ->
+    render: ->
         <span>
             {@render_buy_button()}
             {@render_confirm_button()}
@@ -1492,7 +1649,7 @@ MoveCourse = rclass
         project_id : rtypes.string.isRequired
         redux      : rtypes.object.isRequired
 
-    getInitialState : ->
+    getInitialState: ->
         confirm : false
 
     upgrade: ->
@@ -1524,7 +1681,7 @@ MoveCourse = rclass
                 </ButtonToolbar>
             </Well>
 
-    render : ->
+    render: ->
         <span>
             {@render_move_button()}
             {@render_confirm_button()}
@@ -1541,6 +1698,7 @@ BillingPage = rclass
             error         : rtypes.string
             action        : rtypes.string
             loaded        : rtypes.bool
+            no_stripe     : rtypes.bool     # if true, stripe definitely isn't configured on the server
             selected_plan : rtypes.string
         projects :
             project_map : rtypes.immutable # used, e.g., for course project payments; also computing available upgrades
@@ -1550,23 +1708,35 @@ BillingPage = rclass
     propTypes :
         redux         : rtypes.object
         is_simplified : rtypes.bool
+        for_course    : rtypes.bool
 
-    render_action : ->
+    render_action: ->
         if @props.action
             <div style={position:'relative', top:'-70px'}>   {# probably ActivityDisplay should manage its own position better. }
                 <ActivityDisplay activity ={[@props.action]} on_clear={=>@props.redux.getActions('billing').clear_action()} />
             </div>
 
-    render_error : ->
+    render_error: ->
         if @props.error
             <ErrorDisplay
                 error   = {@props.error}
                 onClose = {=>@props.redux.getActions('billing').clear_error()} />
 
+    render_help_suggestion: ->
+        <span>
+            <Space/> If you have any questions at all, email <HelpEmailLink /> immediately.
+            <i>
+                <Space/> Contact us if you are purchasing a course subscription, but need a short trial
+                to test things out first.<Space/>
+            </i>
+        </span>
+
     render_suggested_next_step: ->
         cards    = @props.customer?.sources?.total_count ? 0
         subs     = @props.customer?.subscriptions?.total_count ? 0
         invoices = @props.invoices?.data?.length ? 0
+        help     = @render_help_suggestion()
+
         if cards == 0
             if subs == 0
                 # no payment sources yet; no subscriptions either: a new user (probably)
@@ -1576,7 +1746,7 @@ BillingPage = rclass
                     choose from either a monthly, yearly or semester-long plan.
                     You will <b>not be charged</b> until you select a specific subscription then click
                     "Add Subscription".
-                    If you have any questions at all, email <HelpEmailLink /> immediately.
+                    {help}
                 </span>
             else
                 # subscriptions but they deleted their card.
@@ -1596,14 +1766,14 @@ BillingPage = rclass
                 same subscription more than once to increase the number of upgrades).
                 You will be charged only after you select a specific subscription and click
                 "Add Subscription".
-                If you have any questions, email <HelpEmailLink /> immediately.
+                {help}
             </span>
         else if invoices == 0
             # have payment source, subscription, but no invoices yet
             <span>
                 Sign up for the same subscription package more than
                 once to increase the number of upgrades that you can use.
-                If you have any questions, email <HelpEmailLink /> immediately.
+                {help}
             </span>
         else
             # have payment source, subscription, and at least one invoice
@@ -1611,7 +1781,7 @@ BillingPage = rclass
                 You may sign up for the same subscription package more than
                 once to increase the number of upgrades that you can use.
                 Past invoices and receipts are also available below.
-                If you have any questions, email <HelpEmailLink /> immediately.
+                {help}
             </span>
 
     render_info_link: ->
@@ -1621,57 +1791,19 @@ BillingPage = rclass
             {@render_suggested_next_step()}
         </div>
 
-    render_course_payment_required: (project, pay) ->
-        {salvus_client} = require('./salvus_client')  # do NOT put at top leve; some code used by server
-        if pay <= salvus_client.server_time()
-            style = "danger"
-            due = <span>now</span>
-        else
-            style = 'info'
-            due = <span><TimeAgo date={pay} /></span>
+    get_panel_header: (icon, header) ->
+        <div style={cursor:'pointer'} >
+            <Icon name={icon} fixedWidth /> {header}
+        </div>
 
-        cards    = @props.customer?.sources?.total_count ? 0
-        subs     = @props.customer?.subscriptions?.total_count ? 0
+    render_subscriptions: ->
+        <Subscriptions
+            subscriptions = {@props.customer.subscriptions}
+            sources       = {@props.customer.sources}
+            selected_plan = {@props.selected_plan}
+            redux         = {@props.redux} />
 
-        project_id = project.get('project_id')
-        member_host = @props.redux.getStore('account').get_total_upgrades()?.member_host
-        if member_host
-            avail = member_host - @props.redux.getStore('projects').get_total_upgrades_you_have_applied()?.member_host
-        else
-            avail = 0
-        if cards == 0
-            if avail == 0
-                action = <b>Click "Add Payment Method" below and enter your credit card number.</b>
-            else
-                action = <span>Either "Add Payment Method" below or use one of your subscriptions to <MoveCourse project_id={project_id} redux={@props.redux}/></span>
-        else
-            if avail == 0
-                action = <PayCourseFee project_id={project_id} redux={@props.redux} />
-            else
-                action = <span>Either <PayCourseFee project_id={project_id} redux={@props.redux} /> or use one of your subscriptions to <MoveCourse project_id={project_id} redux={@props.redux}/></span>
-
-        <Alert bsStyle={style} style={marginTop:'10px'} key={project_id}>
-            <h4><Icon name='exclamation-triangle'/> Warning: The course fee for "{project.get('title')}" is due {due}.
-            </h4>
-            {action}
-        </Alert>
-
-    render_course_payment_instructions: ->
-        if not @props.project_map?
-            return
-        projects = @props.redux.getStore('projects')
-        v = []
-        @props.project_map.map (project, project_id) =>
-            pay = projects.date_when_course_payment_required(project_id)
-            if pay
-                # found a course the needs to be paid for
-                v.push(@render_course_payment_required(project, pay))
-        return v
-
-    get_panel_header : (icon, header) ->
-        <div><Icon name={icon} fixedWidth /> {header}</div>
-
-    render_page : ->
+    render_page: ->
         cards    = @props.customer?.sources?.total_count ? 0
         subs     = @props.customer?.subscriptions?.total_count ? 0
         if not @props.loaded
@@ -1686,49 +1818,30 @@ BillingPage = rclass
             # data loaded and customer exists
             if @props.is_simplified and subs > 0
                 <div>
-                    <Accordion>
-                        <Panel header={@get_panel_header('credit-card', 'Payment Methods')} eventKey='1'>
-                            <PaymentMethods redux={@props.redux} sources={@props.customer.sources} default={@props.customer.default_source} />
-                        </Panel>
-                        <Panel header={@get_panel_header('list-alt', 'Subscriptions')} eventKey='2'>
-                            <Subscriptions
-                                subscriptions = {@props.customer.subscriptions}
-                                sources       = {@props.customer.sources}
-                                selected_plan = {@props.selected_plan}
-                                redux         = {@props.redux} />
-                        </Panel>
-                    </Accordion>
+                    <PaymentMethods redux={@props.redux} sources={@props.customer.sources} default={@props.customer.default_source} />
+                    {<Panel header={@get_panel_header('list-alt', 'Subscriptions')} eventKey='2'>
+                        {@render_subscriptions()}
+                    </Panel> if not @props.for_course}
                 </div>
             else if @props.is_simplified
                 <div>
                     <PaymentMethods redux={@props.redux} sources={@props.customer.sources} default={@props.customer.default_source} />
-                    <Subscriptions
-                        subscriptions = {@props.customer.subscriptions}
-                        sources       = {@props.customer.sources}
-                        selected_plan = {@props.selected_plan}
-                        redux         = {@props.redux} />
+                    {@render_subscriptions() if not @props.for_course}
                 </div>
             else
                 <div>
                     <PaymentMethods redux={@props.redux} sources={@props.customer.sources} default={@props.customer.default_source} />
-                    <Subscriptions
-                        subscriptions = {@props.customer.subscriptions}
-                        sources       = {@props.customer.sources}
-                        selected_plan = {@props.selected_plan}
-                        redux         = {@props.redux} />
+                    {@render_subscriptions() if not @props.for_course}
                     <InvoiceHistory invoices={@props.invoices} redux={@props.redux} />
                 </div>
 
-    render : ->
-        if not Stripe?
-            return <div>Stripe is not available...</div>
+    render: ->
         <div>
             <div>
-                {@render_info_link()}
-                {@render_action()}
+                {@render_info_link() if not @props.for_course}
+                {@render_action() if not @props.no_stripe}
                 {@render_error()}
-                {@render_course_payment_instructions()}
-                {@render_page()}
+                {@render_page() if not @props.no_stripe}
             </div>
             {<Footer/> if not @props.is_simplified}
         </div>
@@ -1736,18 +1849,20 @@ BillingPage = rclass
 exports.BillingPageRedux = rclass
     displayName : 'BillingPage-redux'
 
-    render : ->
-        <Redux redux={redux}>
-            <BillingPage is_simplified={false} redux={redux} />
-        </Redux>
+    render: ->
+        <BillingPage is_simplified={false} redux={redux} />
 
 exports.BillingPageSimplifiedRedux = rclass
     displayName : 'BillingPage-redux'
 
-    render : ->
-        <Redux redux={redux}>
-            <BillingPage is_simplified={true} redux={redux} />
-        </Redux>
+    render: ->
+        <BillingPage is_simplified={true} redux={redux} />
+
+exports.BillingPageForCourseRedux = rclass
+    displayName : 'BillingPage-redux'
+
+    render: ->
+        <BillingPage is_simplified={true} for_course={true} redux={redux} />
 
 render_amount = (amount, currency) ->
     <div style={float:'right'}>{misc.stripe_amount(amount, currency)}</div>
@@ -1760,23 +1875,22 @@ COUNTRIES = ",United States,Canada,Spain,France,United Kingdom,Germany,Russia,Co
 STATES = {'':'',AL:'Alabama',AK:'Alaska',AZ:'Arizona',AR:'Arkansas',CA:'California',CO:'Colorado',CT:'Connecticut',DE:'Delaware',FL:'Florida',GA:'Georgia',HI:'Hawaii',ID:'Idaho',IL:'Illinois',IN:'Indiana',IA:'Iowa',KS:'Kansas',KY:'Kentucky',LA:'Louisiana',ME:'Maine',MD:'Maryland',MA:'Massachusetts',MI:'Michigan',MN:'Minnesota',MS:'Mississippi',MO:'Missouri',MT:'Montana',NE:'Nebraska',NV:'Nevada',NH:'New Hampshire',NJ:'New Jersey',NM:'New Mexico',NY:'New York',NC:'North Carolina',ND:'North Dakota',OH:'Ohio',OK:'Oklahoma',OR:'Oregon',PA:'Pennsylvania',RI:'Rhode Island',SC:'South Carolina',SD:'South Dakota',TN:'Tennessee',TX:'Texas',UT:'Utah',VT:'Vermont',VA:'Virginia',WA:'Washington',WV:'West Virginia',WI:'Wisconsin',WY:'Wyoming',AS:'American Samoa',DC:'District of Columbia',GU:'Guam',MP:'Northern Mariana Islands',PR:'Puerto Rico',VI:'United States Virgin Islands'}
 
 
-# TODO: make this an action and a getter in the BILLING store
+# FUTURE: make this an action and a getter in the BILLING store
 set_selected_plan = (plan, period) ->
-    if period is 'year'
-        redux.getActions('billing').setState(selected_plan : "#{plan}-year")
-    else
-        redux.getActions('billing').setState(selected_plan : plan)
+    if period?.slice(0,4) == 'year'
+        plan = plan + "-year"
+    redux.getActions('billing').setState(selected_plan : plan)
 
 exports.render_static_pricing_page = () ->
     <div>
-        <ExplainResources type='shared' is_static={true}/>
-        <hr/>
         <ExplainPlan type='personal'/>
         <SubscriptionGrid period='month year' is_static={true}/>
         {# <Space/><ExplainResources type='dedicated'/> }
         <hr/>
         <ExplainPlan type='course'/>
-        <SubscriptionGrid period='month4' is_static={true}/>
+        <SubscriptionGrid period='month4 year1' is_static={true}/>
+        <hr/>
+        <ExplainResources type='shared' is_static={true}/>
         <hr/>
         <FAQ/>
         <Footer/>
@@ -1794,6 +1908,3 @@ exports.BillingPageLink = (opts) ->
 plan_interval = (plan) ->
     n = plan.interval_count
     return "#{plan.interval_count} #{misc.plural(n, plan.interval)}"
-
-
-

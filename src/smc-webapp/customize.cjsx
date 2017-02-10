@@ -1,6 +1,6 @@
 ###
 SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
-Copyright (C) 2015, William Stein, GPL v3.
+Copyright (C) 2016, Sagemath Inc.
 ---
 
 Site Customize -- dynamically customize the look of SMC for the client.
@@ -20,6 +20,7 @@ store    = redux.createStore('customize', defaults)
 # to generate static content, which can't be customized.
 $?.get (window.smc_base_url + "/customize"), (obj, status) ->
     if status == 'success'
+        exports.commercial = obj.commercial = (obj.commercial?[0]?.toLowerCase() == 'y')  # make it true if starts with y
         actions.setState(obj)
 
 HelpEmailLink = rclass
@@ -29,7 +30,7 @@ HelpEmailLink = rclass
             help_email : rtypes.string
     propTypes :
         text : rtypes.string
-    render : ->
+    render: ->
         if @props.help_email
             <a href={"mailto:#{@props.help_email}"} target='_blank'>{@props.text ? @props.help_email}</a>
         else
@@ -39,7 +40,7 @@ exports.HelpEmailLink = rclass
     displayName : 'HelpEmailLink-redux'
     propTypes :
         text : rtypes.string
-    render      : ->
+    render: ->
         <Redux redux={redux}>
             <HelpEmailLink text={@props.text} />
         </Redux>
@@ -49,7 +50,7 @@ SiteName = rclass
     reduxProps :
         customize :
             site_name : rtypes.string
-    render : ->
+    render: ->
         if @props.site_name
             <span>{@props.site_name}</span>
         else
@@ -57,33 +58,38 @@ SiteName = rclass
 
 exports.SiteName = rclass
     displayName : 'SiteName-redux'
-    render      : ->
+    render: ->
         <Redux redux={redux}>
             <SiteName />
         </Redux>
 
 SiteDescription = rclass
     displayName : 'SiteDescription'
+    propTypes:
+        style: rtypes.object
     reduxProps :
         customize :
             site_description : rtypes.string
-    render : ->
+    render: ->
+        style = @props.style ? {color:'#666', fontSize:'16px'}
         if @props.site_description?
-            <span style={color:"#666", fontSize:'16px'}>{@props.site_description}</span>
+            <span style={style}>{@props.site_description}</span>
         else
             <Loading/>
 
 exports.SiteDescription = rclass
     displayName : 'SiteDescription-redux'
-    render      : ->
+    propTypes :
+        style : rtypes.object
+    render: ->
         <Redux redux={redux}>
-            <SiteDescription />
+            <SiteDescription style={@props.style}/>
         </Redux>
 
 # TODO also make this configurable? Needed in the <Footer/> and maybe elsewhere …
 exports.CompanyName = rclass
     displayName : 'CompanyName'
-    render :->
+    render:->
         <span>SageMath, Inc.</span>
 
 TermsOfService = rclass
@@ -96,7 +102,7 @@ TermsOfService = rclass
     propTypes :
         style : rtypes.object
 
-    render : ->
+    render: ->
         if not @props.terms_of_service?
             return <div></div>
         return <div style={@props.style} dangerouslySetInnerHTML={__html: @props.terms_of_service}></div>
@@ -107,7 +113,7 @@ exports.TermsOfService = rclass
     propTypes :
         style : rtypes.object
 
-    render : ->
+    render: ->
         <Redux redux={redux}>
             <TermsOfService style={@props.style} />
         </Redux>
@@ -119,13 +125,13 @@ AccountCreationEmailInstructions = rclass
         customize :
             account_creation_email_instructions : rtypes.string
 
-    render : ->
+    render: ->
         <h3 style={marginTop: 0, textAlign: 'center'} >{@props.account_creation_email_instructions}</h3>
 
 exports.AccountCreationEmailInstructions = rclass
     displayName : 'AccountCreationEmailInstructions'
 
-    render : ->
+    render: ->
         <Redux redux={redux}>
             <AccountCreationEmailInstructions />
         </Redux>
@@ -139,3 +145,4 @@ exports.PolicyPricingPageUrl   = smc_base_url + '/policies/pricing.html'
 exports.PolicyPrivacyPageUrl   = smc_base_url + '/policies/privacy.html'
 exports.PolicyCopyrightPageUrl = smc_base_url + '/policies/copyright.html'
 exports.PolicyTOSPageUrl       = smc_base_url + '/policies/terms.html'
+exports.SmcWikiUrl             = 'https://github.com/sagemathinc/smc/wiki/Portal'

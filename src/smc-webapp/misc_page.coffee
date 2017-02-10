@@ -2,7 +2,7 @@
 #
 # SageMathCloud: A collaborative web-based interface to Sage, IPython, LaTeX and the Terminal.
 #
-#    Copyright (C) 2014, William Stein
+#    Copyright (C) 2016, Sagemath Inc.
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -19,11 +19,15 @@
 #
 ###############################################################################
 
+$ = window.$
+
 {IS_MOBILE} = require('./feature')
 misc        = require('smc-util/misc')
 {dmp}       = require('smc-util/syncstring')
 buttonbar   = require('./buttonbar')
 markdown    = require('./markdown')
+
+{redux} = require('./smc-react')
 
 templates = $("#salvus-misc-templates")
 
@@ -95,7 +99,16 @@ $.fn.spin = (opts) ->
             delete data.spinner
         if opts isnt false
             data.spinner = new Spinner($.extend({color: $this.css("color")}, opts)).spin(this)
-    this
+    return this
+
+# jQuery plugin for spinner (/spin/spin.min.js)
+$.fn.exactly_cover = (other) ->
+    @each ->
+        elt = $(this)
+        elt.offset(other.offset())
+        elt.width(other.width())
+        elt.height(other.height())
+    return this
 
 # make all links open internally or in a new tab; etc.
 # opts={project_id:?, file_path:path that contains file}
@@ -103,24 +116,26 @@ $.fn.process_smc_links = (opts={}) ->
     @each ->
         e = $(this)
         a = e.find('a')
-        # make links open in a new tab by default
-        a.attr("target","_blank")
         for x in a
             y = $(x)
             href = y.attr('href')
             if href?
-                if href.indexOf(document.location.origin) == 0
-                    # target starts with cloud URL or is absolute, so we open the
-                    # link directly inside this browser tab
+                if href.indexOf(document.location.origin) == 0 and href.indexOf('/projects/') != -1
+                    # target starts with cloud URL or is absolute, and has /projects/ in it, so we open the
+                    # link directly inside this browser tab.
+                    # WARNING: there are cases that could be wrong via this heuristic, e.g., a raw link that happens
+                    # to have /projects/ in it -- deal with them someday...
                     y.click (e) ->
-                        n = (document.location.origin + '/projects/').length
-                        target = $(@).attr('href').slice(n)
-                        require('./projects').load_target(decodeURI(target), not(e.which==2 or (e.ctrlKey or e.metaKey)))
+                        url = $(@).attr('href')
+                        i = url.indexOf('/projects/')
+                        target = url.slice(i + '/projects/'.length)
+                        redux.getActions('projects').load_target(decodeURI(target), not(e.which==2 or (e.ctrlKey or e.metaKey)))
                         return false
-                else if href.indexOf('http://') != 0 and href.indexOf('https://') != 0
+                else if href.indexOf('http://') != 0 and href.indexOf('https://') != 0  # does not start with http
                     # internal link
                     y.click (e) ->
                         target = $(@).attr('href')
+                        {join} = require('path')
                         if target.indexOf('/projects/') == 0
                             # fully absolute (but without https://...)
                             target = decodeURI(target.slice('/projects/'.length))
@@ -129,23 +144,27 @@ $.fn.process_smc_links = (opts={}) ->
                             target = decodeURI(target.slice(1))  # just get rid of leading slash
                         else if target[0] == '/' and opts.project_id
                             # absolute inside of project
-                            target = "#{opts.project_id}/files#{decodeURI(target)}"
+                            target = join(opts.project_id, 'files', decodeURI(target))
                         else if opts.project_id and opts.file_path?
                             # realtive to current path
-                            target = "#{opts.project_id}/files/#{opts.file_path}/#{decodeURI(target)}"
-                        require('./projects').load_target(target, not(e.which==2 or (e.ctrlKey or e.metaKey)))
+                            target = join(opts.project_id, 'files', opts.file_path, decodeURI(target))
+                        redux.getActions('projects').load_target(target, not(e.which==2 or (e.ctrlKey or e.metaKey)))
                         return false
+                else
+                    # make links open in a new tab by default
+                    a.attr("target","_blank")
 
         # make relative links to images use the raw server
         if opts.project_id and opts.file_path?
-            a = e.find("img")
-            for x in a
-                y = $(x)
-                src = y.attr('src')
-                if src.indexOf('://') != -1
-                    continue
-                new_src = "/#{opts.project_id}/raw/#{opts.file_path}/#{src}"
-                y.attr('src', new_src)
+            for [tag, attr] in [['img', 'src'], ['object', 'data']]
+                for x in e.find(tag)
+                    y = $(x)
+                    src = y.attr(attr)
+                    if src.indexOf('://') != -1
+                        continue
+                    {join} = require('path')
+                    new_src = join('/', window.smc_base_url, opts.project_id, 'raw', opts.file_path, src)
+                    y.attr(attr, new_src)
 
         return e
 
@@ -182,6 +201,31 @@ $.fn.html_noscript = (html) ->
         return t
 
 # MathJax some code -- jQuery plugin
+# ATTN: do not call MathJax directly, but always use this .mathjax() plugin.
+# from React.js, the canonical way to call it is $(ReactDOM.findDOMNode(@)).mathjax() (e.g. Markdown in r_misc.cjsx)
+
+# this queue is used, when starting up or when it isn't configured (yet)
+mathjax_queue = []
+mathjax_enqueue = (x) ->
+    if MathJax?.Hub?
+        if x[0] == 'Typeset'
+            # insert MathJax.Hub as 2nd entry
+            MathJax.Hub.Queue([x[0], MathJax.Hub, x[1]])
+        else
+            MathJax.Hub.Queue(x)
+    else
+        mathjax_queue.push(x)
+
+exports.mathjax_finish_startup = ->
+    for x in mathjax_queue
+        mathjax_enqueue(x)
+    if DEBUG
+        console.log 'finishing mathjax startup'
+
+mathjax_typeset = (el) ->
+    # no MathJax.Hub, since there is no MathJax defined!
+    mathjax_enqueue(["Typeset", el])
+
 $.fn.extend
     mathjax: (opts={}) ->
         opts = defaults opts,
@@ -213,11 +257,11 @@ $.fn.extend
                 element = t.html(tex)
             if opts.hide_when_rendering
                 t.hide()
-            MathJax.Hub.Queue(["Typeset", MathJax.Hub, element[0]])
+            mathjax_typeset(element[0])
             if opts.hide_when_rendering
-                MathJax.Hub.Queue([=>t.show()])
+                mathjax_enqueue([=>t.show()])
             if opts.cb?
-                MathJax.Hub.Queue([opts.cb, t])
+                mathjax_enqueue([opts.cb, t])
             return t
 
 $.fn.extend
@@ -322,7 +366,7 @@ $.fn.extend
 
             if opts.cancel
                 t.data('cancel_editor')?()
-                # TODO: clear state -- get rid of function data...
+                # FUTURE: clear state -- get rid of function data...
                 return
 
             if not opts.value?
@@ -444,6 +488,7 @@ $.fn.extend
 # We factor out this extension so it can be applied to CodeMirror's in iframes, e.g., Jupyter's.
 
 exports.cm_define_diffApply_extension = (cm) ->
+    # applies a diff and returns last pos modified
     cm.defineExtension 'diffApply', (diff) ->
         editor = @
         next_pos = (val, pos) ->
@@ -458,11 +503,13 @@ exports.cm_define_diffApply_extension = (cm) ->
                 return {line:pos.line+number_of_newlines, ch:(val.length - val.lastIndexOf('\n')-1)}
 
         pos = {line:0, ch:0}  # start at the beginning
+        last_pos = undefined
         for chunk in diff
             #console.log(chunk)
             op  = chunk[0]  # 0 = stay same; -1 = delete; +1 = add
             val = chunk[1]  # the actual text to leave same, delete, or add
             pos1 = next_pos(val, pos)
+
             switch op
                 when 0 # stay the same
                     # Move our pos pointer to the next position
@@ -471,6 +518,7 @@ exports.cm_define_diffApply_extension = (cm) ->
                 when -1 # delete
                     # Delete until where val ends; don't change pos pointer.
                     editor.replaceRange("", pos, pos1)
+                    last_pos = pos
                     #console.log("deleting from ", pos, " to ", pos1)
                 when +1 # insert
                     # Insert the new text right here.
@@ -478,6 +526,8 @@ exports.cm_define_diffApply_extension = (cm) ->
                     #console.log("inserted new text at ", pos)
                     # Move our pointer to just beyond the text we just inserted.
                     pos = pos1
+                    last_pos = pos1
+        return last_pos
 
 exports.cm_define_testbot = (cm) ->
     cm.defineExtension 'testbot', (opts) ->
@@ -539,7 +589,7 @@ exports.define_codemirror_extensions = () ->
                     if j != -1
                         level -= 1
                         if level == 0
-                            return [i, j + END.length]
+                            return [i, j + END.length - 1]
 
             else if startswith(line, "\\[")
                 for i in [start.line+1..cm.lastLine()]
@@ -675,18 +725,37 @@ exports.define_codemirror_extensions = () ->
 
     # Set the value of the buffer to something new by replacing just the ranges
     # that changed, so that the view/history/etc. doesn't get messed up.
-    CodeMirror.defineExtension 'setValueNoJump', (value) ->
+    CodeMirror.defineExtension 'setValueNoJump', (value, scroll_last) ->
         r = @getOption('readOnly')
         if not r
             @setOption('readOnly', true)
         @_setValueNoJump = true  # so the cursor events that happen as a direct result of this setValue know.
-        @diffApply(dmp.diff_main(@getValue(), value))
+
+        # Determine information so we can restore the scroll position
+        t      = @getScrollInfo().top
+        b      = @setBookmark(line:@lineAtHeight(t, 'local'))
+        before = @heightAtLine(@lineAtHeight(t, 'local'))
+
+        # Change the buffer in place by applying the diffs as we go; this avoids replacing the entire buffer,
+        # which would cause total chaos.
+        last_pos = @diffApply(dmp.diff_main(@getValue(), value))
+
+        # Now, if possible, restore the exact scroll position.
+        n = b.find()?.line
+        if n?
+            @scrollTo(undefined, @getScrollInfo().top - (before - @heightAtLine(b.find().line)))
+            b.clear()
+
         if not r
             @setOption('readOnly', false)
+            if scroll_last and last_pos?
+                @scrollIntoView(last_pos)
+                @setCursor(last_pos)
+
         delete @_setValueNoJump
 
     CodeMirror.defineExtension 'patchApply', (patch) ->
-        ## TODO: this is a very stupid/inefficient way to turn
+        ## OPTIMIZATION: this is a very stupid/inefficient way to turn
         ## a patch into a diff.  We should just directly rewrite
         ## the code below to work with patch.
         cur_value = @getValue()
@@ -718,13 +787,21 @@ exports.define_codemirror_extensions = () ->
             that.replaceRange(str, from, to)
 
         if completions.length == 1
-            insert(target + completions[0])
+            # do not include target in appended completion if it has a '*'
+            if target.indexOf('*') == -1
+                insert(target + completions[0])
+            else
+                insert(completions[0])
             return
 
         sel = $("<select>").css('width','auto')
         complete = $("<div>").addClass("salvus-completions").append(sel)
         for c in completions
-            sel.append($("<option>").text(target + c))
+            # do not include target in appended completion if it has a '*'
+            if target.indexOf('*') == -1
+                sel.append($("<option>").text(target + c))
+            else
+                sel.append($("<option>").text(c))
         sel.find(":first").attr("selected", true)
         sel.attr("size", Math.min(completions_size, completions.length))
         pos = @cursorCoords(from)
@@ -782,7 +859,7 @@ exports.define_codemirror_extensions = () ->
         opts = defaults opts,
             from      : required
             content   : required
-            type      : required   # 'docstring', 'source-code' -- TODO
+            type      : required   # 'docstring', 'source-code' -- FUTURE:
             target    : required
         element = templates.find(".salvus-codemirror-introspect")
         element.find(".salvus-codemirror-introspect-title").text(opts.target)
@@ -875,13 +952,13 @@ exports.define_codemirror_extensions = () ->
                 return 'mediawiki'
             when 'stex'
                 return 'tex'
-            when 'python' # TODO how to tell it to return sage when in a sagews file?
+            when 'python' # FUTURE how to tell it to return sage when in a sagews file?
                 return 'python'
             when 'r'
                 return 'r'
             when 'julia'
                 return 'julia'
-            when 'sagews'    # this doesn't work
+            when 'sagews'    # WARNING: this doesn't work
                 return 'sage'
             else
                 mode = cm.getOption('mode').name
@@ -934,13 +1011,13 @@ exports.define_codemirror_extensions = () ->
 
         #console.log("edit_selection '#{misc.to_json(opts)}', mode='#{default_mode}'")
 
-        # TODO: will have to make this more sophisticated, so it can
+        # FUTURE: will have to make this more sophisticated, so it can
         # deal with nesting.
         strip = (src, left, right) ->
             #console.log("strip:'#{src}','#{left}','#{right}'")
-            left  = left.trim().toLowerCase()
-            right = right.trim().toLowerCase()
-            src0   = src.toLowerCase()
+            left  = left.toLowerCase()
+            right = right.toLowerCase()
+            src0  = src.toLowerCase()
             i = src0.indexOf(left)
             if i != -1
                 j = src0.lastIndexOf(right)
@@ -956,18 +1033,8 @@ exports.define_codemirror_extensions = () ->
             from = selection.from()
             to = selection.to()
             src = cm.getRange(from, to)
-            # trim whitespace
-            i = 0
-            while i<src.length and /\s/.test(src[i])
-                i += 1
-            j = src.length-1
-            while j > 0 and /\s/.test(src[j])
-                j -= 1
-            j += 1
-            left_white = src.slice(0,i)
-            right_white = src.slice(j)
-            src = src.slice(i,j)
-            src0 = src
+            start_line_beginning = from.ch == 0
+            until_line_ending    = cm.getLine(to.line).length == to.ch
 
             mode1 = mode
             data_for_mode = EDIT_COMMANDS[mode1]
@@ -980,9 +1047,23 @@ exports.define_codemirror_extensions = () ->
                     # html fallback for markdown
                     mode1 = 'html'
                 else if mode1 == "python"
-                    # Sage fallback in python mode. TODO There should be a Sage mode.
+                    # Sage fallback in python mode. FUTURE: There should be a Sage mode.
                     mode1 = "sage"
                 how = EDIT_COMMANDS[mode1][cmd]
+
+            # trim whitespace
+            i = 0
+            j = src.length-1
+            if how? and (if how.trim? then how.trim else true)
+                while i < src.length and /\s/.test(src[i])
+                    i += 1
+                while j > 0 and /\s/.test(src[j])
+                    j -= 1
+            j += 1
+            left_white  = src.slice(0,i)
+            right_white = src.slice(j)
+            src         = src.slice(i,j)
+            src0        = src
 
             done = false
 
@@ -993,31 +1074,52 @@ exports.define_codemirror_extensions = () ->
                 done = true
 
             if how?.wrap?
-                if how.strip?
-                    # Strip out any tags/wrapping from conflicting modes.
-                    for c in how.strip
-                        wrap = EDIT_COMMANDS[mode1][c].wrap
-                        if wrap?
-                            {left, right} = wrap
-                            src1 = strip(src, left, right)
-                            if src1?
-                                src = src1
+                space = how.wrap.space
+                left  = how.wrap.left  ? ""
+                right = how.wrap.right ? ""
+                process = (src) ->
+                    if how.strip?
+                        # Strip out any tags/wrapping from conflicting modes.
+                        for c in how.strip
+                            wrap = EDIT_COMMANDS[mode1][c].wrap
+                            if wrap?
+                                src1 = strip(src, wrap.left ? '', wrap.right ? '')
+                                if src1?
+                                    src = src1
+                                    if space and src[0] == ' '
+                                        src = src.slice(1)
 
-                left  = if how.wrap.left?  then how.wrap.left else ""
-                right = if how.wrap.right? then how.wrap.right else ""
-                src1 = strip(src, left, right)
-                if src1
-                    # strip the wrapping
-                    src = src1
+                    src1  = strip(src, left, right)
+                    if src1
+                        # strip the wrapping
+                        src = src1
+                        if space and src[0] == ' '
+                            src = src.slice(1)
+                    else
+                        # do the wrapping
+                        src = "#{left}#{if space then ' ' else ''}#{src}#{right}"
+                    return src
+
+                if how.wrap.multi
+                    src = (process(x) for x in src.split('\n')).join('\n')
                 else
-                    # do the wrapping
-                    src = "#{left}#{src}#{right}"
+                    src = process(src)
+                if how.wrap.newline
+                    src = '\n' + src + '\n'
+                    if not start_line_beginning
+                        src = '\n' + src
+                    if not until_line_ending
+                        src += '\n'
                 done = true
 
             if how?.insert? # to insert the code snippet right below, next line
-                # TODO no idea what the strip(...) above is actually doing
-                # if text is selected (is that src?) then there is only some new stuff below it. that's it.
-                src = "#{src}\n#{how.insert}"
+                # SMELL: no idea what the strip(...) above is actually doing
+                # no additional newline, if nothing is selected and at start of line
+                if selection.empty() and from.ch == 0
+                    src = how.insert
+                else
+                    # this also inserts a new line, if cursor is inside/end of line
+                    src = "#{src}\n#{how.insert}"
                 done = true
 
             if cmd == 'font_size'
@@ -1075,18 +1177,21 @@ exports.define_codemirror_extensions = () ->
             if src == src0
                 continue
 
+            cm.focus()
             cm.replaceRange(left_white + src + right_white, from, to)
-            if selection.empty()
-                # restore cursor
-                if left?
-                    delta = left.length
+
+            if not how?.insert? and not how?.wrap?
+                if selection.empty()
+                    # restore cursor
+                    if left?
+                        delta = left.length
+                    else
+                        delta = 0
+                    cm.setCursor({line:from.line, ch:to.ch+delta})
                 else
-                    delta = 0
-                cm.setCursor({line:from.line, ch:to.ch+delta})
-            else
-                # now select the new range
-                delta = src.length - src0.length
-                cm.addSelection(from, {line:to.line, ch:to.ch+delta})
+                    # now select the new range
+                    delta = src.length - src0.length
+                    cm.extendSelection(from, {line:to.line, ch:to.ch+delta})
 
 
     CodeMirror.defineExtension 'insert_link', (opts={}) ->
@@ -1201,7 +1306,7 @@ exports.define_codemirror_extensions = () ->
     CodeMirror.defineExtension 'tex_ensure_preamble', (code) ->
         cm = @
         # ensures that the given line is the pre-amble of the latex document.
-        # TODO: actually implement this!
+        # FUTURE: actually implement this!
 
         # in latex document do one thing
 
@@ -1335,7 +1440,7 @@ exports.define_codemirror_extensions = () ->
             dialog.modal('hide')
             code = target.attr("title")
             s = "&#{code};"
-            # TODO HTML-based formats will work, but not LaTeX.
+            # FUTURE: HTML-based formats will work, but not LaTeX.
             # As long as the input encoding in LaTeX is utf8, just insert the actual utf8 character (target.text())
 
             selections = cm.listSelections()
@@ -1370,6 +1475,70 @@ exports.define_codemirror_extensions = () ->
             return false
         if line?
             return {line:line, ch:ch}
+
+    # Format the selected block (or blocks) of text, so it looks like this:
+    #    stuff  : 'abc'
+    #    foo    : 1
+    #    more_0 : 'blah'
+    # Or
+    #    stuff  = 'abc'
+    #    foo    = 1
+    #    more_0 = 'blah'
+    # The column separate is the first occurence in the first line of
+    # one of '=' or ':'.  Selected lines that don't contain either symbol
+    # are ignored.
+    CodeMirror.defineExtension 'align_assignments', () ->
+        for sel in @listSelections()
+            {start_line, end_line} = cm_start_end(sel)
+            symbol = undefined
+            column = 0
+            # first pass -- figure out what the symbol is and what column we will move it to.
+            for n in [start_line .. end_line]
+                x = @getLine(n)
+                if not symbol?
+                    # we still don't know what the separate symbol is.
+                    if ':' in x
+                        symbol = ':'
+                    else if '=' in x
+                        symbol = '='
+                i = x.indexOf(symbol)
+                if i == -1
+                    continue   # no symbol in this line, so skip
+                # reduce i until x[i-1] is NOT whitespace.
+                while i > 0 and x[i-1].trim() == ''
+                    i -= 1
+                i += 1
+                column = Math.max(i, column)
+            if not symbol? or not column
+                continue  # no symbol in this selection, or no need to move it.  Done.
+            # second pass -- move symbol over by inserting space
+            for n in [start_line .. end_line]
+                x = @getLine(n)
+                i = x.indexOf(symbol)
+                if i != -1
+                    # There is a symbol in this line -- put it in the spot where we want it.
+                    if i < column
+                        # symbol is too early -- add space
+                        spaces = (' ' for j in [0...(column-i)]).join('')  # column - i spaces
+                        # insert spaces in front of the symbol
+                        @replaceRange(spaces, {line:n, ch:i}, {line:n, ch:i})
+                    else if i > column
+                        # symbol is too late -- remove spaces
+                        @replaceRange('', {line:n, ch:column}, {line:n, ch:i})
+                    # Ensure the right amount of whitespace after the symbol -- exactly one space
+                    j = i + 1  # this will be the next position after x[i] that is not whitespace
+                    while j < x.length and x[j].trim() == ''
+                        j += 1
+                    if j - i >= 2
+                        # remove some spaces
+                        @replaceRange('', {line:n, ch:column+1}, {line:n, ch:column+(j-i-1)})
+                    else if j - i == 1
+                        # insert a space
+                        @replaceRange(' ', {line:n, ch:column+1}, {line:n, ch:column+1})
+
+
+
+
 
     # Natural analogue of getLine, which codemirror doesn't have for some reason
     #CodeMirror.defineExtension 'setLine', (n, value) ->
@@ -1464,12 +1633,12 @@ $("body").on "show.bs.tooltip", (e) ->
 
 exports.load_coffeescript_compiler = (cb) ->
     if CoffeeScript?
-        cb()
+        cb?()
     else
         require.ensure [], =>
             require("script!coffeescript/coffee-script.js")
-            console.log("loaded CoffeeScript via reqire.ensure")
-            cb()
+            console.log("loaded CoffeeScript via require.ensure")
+            cb?()
             #$.getScript "/static/coffeescript/coffee-script.js", (script, status) ->
             #    console.log("loaded CoffeeScript -- #{status}")
             #    cb()
@@ -1479,7 +1648,7 @@ exports.load_coffeescript_compiler = (cb) ->
 exports.html_to_text = (html) -> $($.parseHTML(html)).text()
 
 exports.language = () ->
-    (if navigator.languages then navigator.languages[0] else (navigator.language or navigator.userLanguage))
+    (if navigator?.languages then navigator?.languages[0] else (navigator?.language or navigator?.userLanguage))
 
 
 # get the currently selected html
@@ -1518,7 +1687,7 @@ exports.restore_selection = (selected_range) ->
 #
 # in any case, almost all tags should be allowed here, no need to be too strict.
 #
-# Note/TODO: the ones based on google-caja-sanitizer seem to have a smaller footprint,
+# FUTURE: the ones based on google-caja-sanitizer seem to have a smaller footprint,
 # but I (hsy) wasn't able to configure them in such a way that all tags/attributes are allowed.
 # It seems like there is some bug in the library, because the definitions to allow e.g. src in img are there.
 
@@ -1543,3 +1712,53 @@ return _sanitize_html_lib html,
         allowedTags: _sanitize_html_allowedTags
         allowedAttributes: _sanitize_html_allowedAttributes
 ###
+
+# `analytics` is a generalized wrapper for reporting data to google analytics, pwiki, parsley, ...
+# for now, it either does nothing or works with GA
+# this API basically allows to send off events by name and category
+
+exports.analytics = (type, args...) ->
+    # GoogleAnalyticsObject contains the possibly customized function name of GA.
+    # It's a good idea to call it differently from the default 'ga' to avoid name clashes...
+    if window.GoogleAnalyticsObject?
+        ga = window[window.GoogleAnalyticsObject]
+        if ga?
+            switch type
+                when 'event', 'pageview'
+                    ga('send', type, args...)
+                else
+                    console.warn("unknown analytics event '#{type}'")
+
+exports.analytics_pageview = (args...) ->
+    exports.analytics('pageview', args...)
+
+exports.analytics_event = (args...) ->
+    exports.analytics('event', args...)
+
+# These are used to disable pointer events for iframes when dragging something that may move over an iframe.
+# See http://stackoverflow.com/questions/3627217/jquery-draggable-and-resizeable-over-iframes-solution
+exports.drag_start_iframe_disable = ->
+    $("iframe:visible").css('pointer-events', 'none')
+
+exports.drag_stop_iframe_enable = ->
+    $("iframe:visible").css('pointer-events', 'auto')
+
+exports.open_popup_window = (url) ->
+    exports.open_new_tab(url, popup=true)
+
+# open new tab and check if user allows popups. if yes, return the tab -- otherwise show an alert and return null
+exports.open_new_tab = (url, popup=false) ->
+    # if popup=true, it opens a small overlay window instead of a new tab
+    if popup
+        tab = window.open(url, '', 'menubar=no,toolbar=no,resizable=yes,scrollbars=yes,height=400,width=600')
+    else
+        tab = window.open(url)
+    if(!tab || tab.closed || typeof tab.closed=='undefined')
+        {alert_message} = require('./alerts')
+        alert_message
+            title   : "Pop-ups blocked."
+            message : "Either enable pop-ups for this website or <a href='#{url}' target='_blank'>click on this link</a>."
+            type    : 'error'
+            timeout : 10
+        return null
+    return tab
